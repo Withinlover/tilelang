@@ -34,6 +34,9 @@ def allow_autoschedule(pass_ctx=None) -> bool:
 
 
 def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
+    from tilelang.ascend.distributed.capabilities import reject_native_distributed
+
+    reject_native_distributed(mod)
     mod = tirx.transform.BindTarget(target)(mod)
     # Materialize the target-neutral kernel-launch nest emitted by T.Kernel.
     # Ascend's NPU launch is a real 1-D blockIdx.x core grid, so the grid loop

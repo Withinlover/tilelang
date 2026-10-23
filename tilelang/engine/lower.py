@@ -112,6 +112,9 @@ def lower_to_host_device_ir(
     runtime_only: bool = False,
 ) -> tuple[tvm.IRModule, tvm.IRModule, list[KernelParam] | None, Target, Target]:
     """Lower to split IR under a per-compilation instrumentation session."""
+    from tilelang.analysis.distributed_checker import reject_native_distributed
+
+    reject_native_distributed(func_or_mod)
 
     has_session = current_compile_pass_instrumentation() is not None
     with compile_pass_instrumentation(name="lower-to-host-device-ir"):
@@ -158,6 +161,9 @@ def lower_with_context(
     default.
     """
 
+    from tilelang.analysis.distributed_checker import reject_native_distributed
+
+    reject_native_distributed(func_or_mod)
     has_session = current_compile_pass_instrumentation() is not None
     with compile_pass_instrumentation(name="lower-with-context"):
         attach_instruments = nullcontext() if has_session else instrument_current_pass_context()
@@ -230,6 +236,9 @@ def lower(
     default.
     """
 
+    from tilelang.analysis.distributed_checker import reject_native_distributed
+
+    reject_native_distributed(func_or_mod)
     has_session = current_compile_pass_instrumentation() is not None
     with compile_pass_instrumentation(name="lower"):
         attach_instruments = nullcontext() if has_session else instrument_current_pass_context()

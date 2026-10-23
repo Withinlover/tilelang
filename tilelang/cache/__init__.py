@@ -87,6 +87,9 @@ def cached(
     """
     Caches and reuses compiled kernels (using KernelCache class).
     """
+    from tilelang.analysis.distributed_checker import reject_native_distributed
+
+    reject_native_distributed(func)
     cache, backend_context, verbose = _resolve_cache_dispatch(target, target_host, execution_backend, verbose)
     return cache.cached(
         func,

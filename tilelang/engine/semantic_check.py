@@ -29,3 +29,8 @@ def PreLowerSemanticCheck(mod: IRModule) -> None:
     tilelang.analysis.NestedLoopChecker()(mod)
     tilelang.analysis.ParallelLocalIndexChecker()(mod)
     tilelang.analysis.FragmentLoopChecker()(mod)
+    # Communication invariants are checked before target scheduling can erase
+    # event identity or move ordinary accesses across publication boundaries.
+    from tilelang.analysis.distributed_checker import DistributedChecker
+
+    DistributedChecker()(mod)

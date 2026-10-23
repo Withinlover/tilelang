@@ -103,6 +103,9 @@ class JITKernel(Generic[_P, _T]):
             Pre-resolved context supplied by compiler infrastructure. Direct
             callers may omit it and let this public entry resolve one context.
         """
+        from tilelang.analysis.distributed_checker import reject_native_distributed
+
+        reject_native_distributed(func)
         self.prim_func = func
         self.verbose = verbose
 

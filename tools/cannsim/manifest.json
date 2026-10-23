@@ -1,0 +1,102 @@
+{
+  "schema_version": 1,
+  "name": "TileLang distributed P0 pure-Cube companion",
+  "scope": "Only additions needed by this branch; not the full locally modified helper or an upstream helper release.",
+  "base_repository": "https://gitcode.com/Withinlover/cannsim-helper",
+  "base_revision": "2eb1ce5a79a76cc3f3e1c0eb4b04c6e9f6f694cf",
+  "patch_file": "p0_companion.patch",
+  "patch_sha256": "c5eed05ba31974600861ce70fbfe6be2596b0f5ba51b9191ca2c94f91f504b16",
+  "license": {
+    "additions": "TileLang repository LICENSE, copied verbatim to cosim/LICENSE",
+    "upstream": "The pinned helper tree has no license file; no license for existing upstream files is inferred or granted by this companion."
+  },
+  "compatibility": {
+    "python": "3.11-3.13",
+    "numpy": "2.2.6",
+    "cann": "9.1.0",
+    "soc": "Ascend950PR_9589",
+    "expected_cores": [
+      "AIC"
+    ],
+    "mix_scheduler_fix": "off only",
+    "gemm": "BF16 A[64,64] @ B[64,64] -> FP32 C[64,64]; one block; tiling key 0",
+    "arguments": "Helper passes 32 bytes; pure-Cube object reads only A/B/C pointers at byte offsets 0/8/16; the final reserved word is unused."
+  },
+  "excluded_local_changes": [
+    "MIX scheduler shim and native fixes",
+    "FA/DSA or FA CV12 adapters",
+    "Existing tracked helper files including CMakeLists.txt, run.py and utils/execution.py",
+    "Precompiled objects, simulator libraries, runtime output, machine-specific paths"
+  ],
+  "files": {
+    "cosim/LICENSE": {
+      "sha256": "f70e5cdc24c3797af741930440086f9a0ad36930b05a3dfc25b420936dc2cfa1",
+      "bytes": 1283,
+      "origin": "TileLang root LICENSE copied verbatim"
+    },
+    "cosim/PROVENANCE.md": {
+      "sha256": "80a26d863e35e1ae3be26e123124b55ea045715f0850fb46ff8262f349a4cb2c",
+      "bytes": 1375,
+      "origin": "New companion compatibility adapter, tests, or provenance documentation"
+    },
+    "cosim/__init__.py": {
+      "sha256": "02603347fc322c5479efadad2fd44117ef9aa280874ff2ec15b1d9b1d3964c02",
+      "bytes": 568,
+      "origin": "Locally authored dual-rank extension, 2026-10-23",
+      "origin_sha256": "697c48df3c0a7780bebb6b2fc2ef79bbdaf3aa9b54be1c7fce1f2b29b9ba737e",
+      "adaptation": "Formatting only"
+    },
+    "cosim/protocol.py": {
+      "sha256": "d2eb7acc06c1ada9605681b85e8e93319562a6616b9e98fabfc920e44a442c15",
+      "bytes": 29247,
+      "origin": "Locally authored dual-rank extension, 2026-10-23",
+      "origin_sha256": "3a4ec6522d956bd01656185e5b649e78b79e064dfa480eb15bc7bc126f8f2a79",
+      "adaptation": "Formatting only"
+    },
+    "cosim/runtime.py": {
+      "sha256": "e1c0e321d3389351c412b58f6233bf5acb9139c30bb5e7719ce09f2e86518ee3",
+      "bytes": 1524,
+      "origin": "New companion compatibility adapter, tests, or provenance documentation"
+    },
+    "cosim/segments.py": {
+      "sha256": "e1fe3a15cd98ee6a9892bc729a16d0907d845a8fd7846129d1d4ca21933086f7",
+      "bytes": 12911,
+      "origin": "Locally authored dual-rank extension, 2026-10-23",
+      "origin_sha256": "88e11cc92c791ebae89ea53741b4fca6316c5cd9d7ee0d7d366934655d885c1b",
+      "adaptation": "Formatting; runtime imports and off-only scope"
+    },
+    "cosim/worker.py": {
+      "sha256": "8bac5aca351e094d6b5aa7ba1d80c95aef4afe5f5abbc8e5e9939fd5c6acdf16",
+      "bytes": 3206,
+      "origin": "Locally authored dual-rank extension, 2026-10-23",
+      "origin_sha256": "7b33db7807e0c072fc43a850d5077eca5c3deed7f3af558591b051ec708f139c",
+      "adaptation": "Formatting only"
+    },
+    "tests/test_cosim_protocol.py": {
+      "sha256": "715ce1ff883866fb77b93d36fd451f5b4a65b3ea8f5fe00a34f1687efc708f9a",
+      "bytes": 21090,
+      "origin": "Locally authored dual-rank extension, 2026-10-23",
+      "origin_sha256": "79c1c6f61133e632465ab2434d509d9b24f6bd601988dbc905553bc4e872e066",
+      "adaptation": "Formatting only"
+    },
+    "tests/test_cosim_runtime.py": {
+      "sha256": "2cffd8fb5b14a4cc16a29d276be5beeb0840c332e75b32e685e3368474961605",
+      "bytes": 1652,
+      "origin": "New companion compatibility adapter, tests, or provenance documentation"
+    },
+    "tests/test_cosim_segments.py": {
+      "sha256": "747e6a3f34496dd981448f00a53a0e3c784059b8d79c2bb08ca2ec7bbcfb5fb7",
+      "bytes": 12054,
+      "origin": "Locally authored dual-rank extension, 2026-10-23",
+      "origin_sha256": "29c02921e37d0243a485f4dd5dd87ecc0e8c3ca74d283920785918e0be6ac870",
+      "adaptation": "Formatting only"
+    },
+    "tests/test_cosim_worker.py": {
+      "sha256": "558b24fc27416572117c492d2f6871143736aa55cf108e0a99669b76e7d9e532",
+      "bytes": 8017,
+      "origin": "Locally authored dual-rank extension, 2026-10-23",
+      "origin_sha256": "6e6a466a493486fd89c8b290549e955378f4b170fe479fa8be5ccdd6de158153",
+      "adaptation": "Formatting only"
+    }
+  }
+}

@@ -944,6 +944,10 @@ class Builder(BaseBuilder):
             # buffers (e.g. T.copy(A, B)) also carry a source location.
             if isinstance(arg, Buffer):
                 self.with_buffer_span(arg)
+                if hasattr(value, "_distributed_spec"):
+                    from tilelang.language.distributed import bind_buffer_annotation
+
+                    bind_buffer_annotation(self, value, arg)
             return arg
         elif value is self.empty:
             raise ValueError(f"Argument `{name}` is not annotated")
@@ -1274,6 +1278,10 @@ def _patch_prim_func_attrs(pf: PrimFunc, builder: Builder) -> PrimFunc:
         if isinstance(flags, str):
             flags = [flags]
         pf = pf.with_attr("tilelang_compile_flags", flags)
+    if hasattr(builder, "distributed_state"):
+        from tilelang.language.distributed import normalize_prim_func
+
+        pf = normalize_prim_func(pf, builder)
     return pf
 
 

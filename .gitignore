@@ -21,6 +21,11 @@ debug/
 build/
 *dist/
 dist*/
+!tilelang/distributed/
+!tilelang/language/distributed/
+!tilelang/ascend/distributed/
+!testing/ascend/distributed/
+!examples/distributed/
 wheelhouse/
 __pycache__
 nnfusion.tar.gz

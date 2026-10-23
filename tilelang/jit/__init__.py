@@ -139,6 +139,9 @@ def compile(
         Set to "1", "true", "yes", or "on" to enable verbose compilation by default.
     """
 
+    from tilelang.analysis.distributed_checker import reject_native_distributed
+
+    reject_native_distributed(func)
     assert isinstance(func, PrimFunc), f"target function must be a PrimFunc but got {type(func)}"
 
     # Merge function-level attrs from PrimFunc

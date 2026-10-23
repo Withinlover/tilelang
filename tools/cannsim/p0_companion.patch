@@ -1,0 +1,2265 @@
+diff --git a/cosim/LICENSE b/cosim/LICENSE
+new file mode 100644
+index 0000000..09dd51c
+--- /dev/null
++++ b/cosim/LICENSE
+@@ -0,0 +1,23 @@
++    MIT License
++
++    Copyright (c) Tile-AI.
++    **During the period from December 1, 2024, to Mar 14, 2025, this project is
++    subject to additional collaboration terms with Microsoft Corporation.**
++
++    Permission is hereby granted, free of charge, to any person obtaining a copy
++    of this software and associated documentation files (the "Software"), to deal
++    in the Software without restriction, including without limitation the rights
++    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++    copies of the Software, and to permit persons to whom the Software is
++    furnished to do so, subject to the following conditions:
++
++    The above copyright notice and this permission notice shall be included in all
++    copies or substantial portions of the Software.
++
++    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++    SOFTWARE
+diff --git a/cosim/PROVENANCE.md b/cosim/PROVENANCE.md
+new file mode 100644
+index 0000000..597532a
+--- /dev/null
++++ b/cosim/PROVENANCE.md
+@@ -0,0 +1,25 @@
++# P0 pure-Cube companion
++
++These new modules and the accompanying `tests/test_cosim_*.py` files were
++created for the TileLang Ascend 950 distributed P0 implementation on
++2026-10-23. They are distributed from TileLang's `tools/cannsim/` bundle;
++`cosim/LICENSE` preserves the TileLang repository license for these additions.
++They are not an upstream cannsim-helper release.
++
++The compatibility base is cannsim-helper commit
++`2eb1ce5a79a76cc3f3e1c0eb4b04c6e9f6f694cf` from
++`https://gitcode.com/Withinlover/cannsim-helper`.
++The pinned tree has no license file. This companion does not grant or infer a
++license for that existing upstream tree and does not modify its tracked files.
++
++`protocol.py`, `worker.py`, and the original segment/protocol/worker tests come
++from the locally developed dual-rank extension. `segments.py` uses the new
++`runtime.py` to adapt to the base revision's two-argument `record_environment`
++API. This adapter accepts only explicit scheduler-fix mode `off`; no MIX
++scheduler repair, Flash Attention changes, or precompiled object is included.
++The helper's original mixed-core default is retained. P0 explicitly selects
++`expected_cores=("AIC",)` for its pure-Cube object.
++
++This is a CPU communication protocol model combined with independent
++single-device CANN recordings. It does not execute real inter-device transfers
++or certify multi-device performance.
+diff --git a/cosim/__init__.py b/cosim/__init__.py
+new file mode 100644
+index 0000000..1b778a2
+--- /dev/null
++++ b/cosim/__init__.py
+@@ -0,0 +1,37 @@
++"""Explicit CPU rank-protocol co-simulation beside single-card CANN kernels."""
++
++from .protocol import (
++    BufferRef,
++    Compute,
++    CopyAsync,
++    DeadlockError,
++    Delay,
++    Event,
++    ProtocolError,
++    PutSignal,
++    Quiet,
++    Signal,
++    SignalRef,
++    Simulator,
++    Wait,
++    WaitSignal,
++    Write,
++)
++
++__all__ = [
++    "BufferRef",
++    "Compute",
++    "CopyAsync",
++    "DeadlockError",
++    "Delay",
++    "Event",
++    "ProtocolError",
++    "PutSignal",
++    "Quiet",
++    "Signal",
++    "SignalRef",
++    "Simulator",
++    "Wait",
++    "WaitSignal",
++    "Write",
++]
+diff --git a/cosim/protocol.py b/cosim/protocol.py
+new file mode 100644
+index 0000000..d9b19bf
+--- /dev/null
++++ b/cosim/protocol.py
+@@ -0,0 +1,710 @@
++"""CPU model of rank protocols; ticks are logical and have no physical unit.
++
++Each buffer is an independent, whole-array region. This models explicit READY / ACK
++slot protocols, not caches, interconnects, or simultaneous CANN devices. Publication
++leases deliberately require ACK acquisition before reuse, including at run exit.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++import heapq
++import random
++from typing import Callable, Generator, Mapping
++
++import numpy as np
++
++
++class ProtocolError(RuntimeError):
++    """A modeled memory, epoch, or ownership rule was violated."""
++
++
++class DeadlockError(ProtocolError):
++    """No runnable rank or future event can satisfy the remaining waits."""
++
++
++@dataclass(frozen=True)
++class BufferRef:
++    rank: int
++    name: str
++    slot: int = 0
++
++    def __str__(self):
++        return f"r{self.rank}:{self.name}[{self.slot}]"
++
++
++@dataclass(frozen=True)
++class SignalRef:
++    rank: int
++    name: str
++    slot: int = 0
++
++    def __str__(self):
++        return f"r{self.rank}:{self.name}[{self.slot}]"
++
++
++@dataclass(frozen=True)
++class Write:
++    ref: BufferRef
++    data: np.ndarray
++
++
++@dataclass(frozen=True)
++class CopyAsync:
++    src: BufferRef
++    dst: BufferRef
++
++
++@dataclass(frozen=True)
++class PutSignal:
++    src: BufferRef
++    dst: BufferRef
++    signal: SignalRef
++    value: int
++
++
++@dataclass(frozen=True)
++class Wait:
++    event: Event
++    completion: str = "local"
++
++
++@dataclass(frozen=True)
++class Signal:
++    ref: SignalRef
++    value: int
++    release_regions: tuple[BufferRef, ...] = ()
++
++
++@dataclass(frozen=True)
++class WaitSignal:
++    ref: SignalRef
++    value: int
++    covers: tuple[BufferRef, ...] = ()
++
++
++@dataclass(frozen=True)
++class Compute:
++    name: str
++    reads: tuple[BufferRef, ...]
++    writes: tuple[BufferRef, ...]
++    callback: Callable
++    ticks: int = 1
++
++
++@dataclass(frozen=True)
++class Delay:
++    ticks: int
++
++
++@dataclass(frozen=True)
++class Quiet:
++    pass
++
++
++@dataclass
++class Event:
++    id: int
++    rank: int
++    kind: str
++    local_done: bool = False
++    remote_done: bool = False
++    payload_done: bool = False
++    src: BufferRef | None = None
++    dst: BufferRef | None = None
++    lease: int | None = None
++
++
++@dataclass
++class _Buffer:
++    data: np.ndarray
++    version: int = 0
++    readers: set[int] = field(default_factory=set)
++    writers: set[int] = field(default_factory=set)
++
++
++@dataclass
++class _Signal:
++    value: int
++    issued: int
++    writer: int | None = None
++    publications: tuple[int, ...] = ()
++    acknowledgements: tuple[int, ...] = ()
++
++
++@dataclass
++class _Lease:
++    id: int
++    kind: str
++    ref: BufferRef
++    publisher: int
++    consumer: int
++    epoch: int | None
++    version: int | None = None
++    acquired: bool = False
++    consumed: bool = False
++    ack_sent: bool = False
++    ack_acquired: bool = False
++
++
++@dataclass
++class _Rank:
++    program: Generator
++    started: bool = False
++    done: bool = False
++    result: object = None
++    blocked: object = None
++
++
++class Simulator:
++    """Deterministic discrete-event interpreter for explicitly declared regions.
++
++    ``Compute`` is asynchronous; its callback receives positional read snapshots
++    and returns one tuple entry per write. A callback may invoke a real single-card
++    simulator. The wall time spent in that callback never changes logical ticks.
++    Faults are injected once per run: early_ready, drop_signal, drop_ack, or
++    corrupt_payload. The latter preserves source data and protocol ordering.
++    """
++
++    def __init__(self, seed=0, min_delay=1, max_delay=4, fault=None, max_steps=100000):
++        if not 1 <= min_delay <= max_delay:
++            raise ValueError("require 1 <= min_delay <= max_delay")
++        if fault not in (None, "early_ready", "drop_signal", "drop_ack", "corrupt_payload"):
++            raise ValueError(f"unknown fault: {fault}")
++        self.seed, self.min_delay, self.max_delay = seed, min_delay, max_delay
++        self.fault, self.max_steps = fault, max_steps
++        self._rng = random.Random(seed)
++        self._buffers: dict[BufferRef, _Buffer] = {}
++        self._signals: dict[SignalRef, _Signal] = {}
++        self._events: dict[int, Event] = {}
++        self._leases: dict[int, _Lease] = {}
++        self._ranks: dict[int, _Rank] = {}
++        self._queue = []
++        self._deferred = []
++        self._sequence = 0
++        self._fault_used = False
++        self._ran = False
++        self._passed = False
++        self._error = None
++        self.now = 0
++        self.trace_events: list[dict] = []
++
++    def register_buffer(self, ref: BufferRef, data: np.ndarray):
++        if self._ran or ref in self._buffers:
++            raise ValueError(f"buffer already registered or run started: {ref}")
++        self._validate_ref(ref)
++        array = np.asarray(data)
++        if array.dtype.hasobject:
++            raise ValueError("object buffers are unsupported")
++        self._buffers[ref] = _Buffer(np.array(array, copy=True, order="C"))
++
++    def register_signal(self, ref: SignalRef, value=0):
++        if self._ran or ref in self._signals:
++            raise ValueError(f"signal already registered or run started: {ref}")
++        self._validate_ref(ref)
++        self._check_epoch(value, initial=True)
++        self._signals[ref] = _Signal(value, value)
++
++    @staticmethod
++    def _validate_ref(ref):
++        if not isinstance(ref.rank, int) or ref.rank < 0 or not isinstance(ref.slot, int) or ref.slot < 0:
++            raise ValueError("rank and slot must be nonnegative integers")
++        if not isinstance(ref.name, str) or not ref.name:
++            raise ValueError("region name must be nonempty")
++
++    @staticmethod
++    def _check_epoch(value, initial=False):
++        if isinstance(value, bool) or not isinstance(value, int) or value < (0 if initial else 1):
++            raise ProtocolError("epoch must be a positive integer (initial value may be zero)")
++        if value >= 2**64:
++            raise ProtocolError("epoch would wrap uint64")
++
++    def _trace(self, name, rank, **args):
++        self.trace_events.append({"name": name, "ph": "i", "s": "t", "ts": self.now, "pid": rank, "tid": "protocol", "args": args})
++
++    def _schedule(self, ticks, callback):
++        self._sequence += 1
++        heapq.heappush(self._queue, (self.now + ticks, self._sequence, callback))
++
++    def _delay(self):
++        return self._rng.randint(self.min_delay, self.max_delay)
++
++    def _event(self, rank, kind, **kwargs):
++        event = Event(len(self._events) + 1, rank, kind, **kwargs)
++        self._events[event.id] = event
++        return event
++
++    def _prefix(self, rank):
++        # Keep events after local wait: local completion does not remove a put
++        # from the release prefix before its remote completion.
++        return tuple(e for e in self._events.values() if e.rank == rank and e.kind != "compute")
++
++    @staticmethod
++    def _complete(event):
++        return event.local_done if event.kind in ("get", "compute") else event.remote_done
++
++    def _buffer(self, ref):
++        try:
++            return self._buffers[ref]
++        except KeyError as error:
++            raise ProtocolError(f"unregistered buffer: {ref}") from error
++
++    def _signal(self, ref):
++        try:
++            return self._signals[ref]
++        except KeyError as error:
++            raise ProtocolError(f"unregistered signal: {ref}") from error
++
++    def _active_leases(self, ref):
++        return [lease for lease in self._leases.values() if lease.ref == ref and not lease.ack_acquired]
++
++    def _check_write(self, ref):
++        buffer = self._buffer(ref)
++        if buffer.readers or buffer.writers:
++            raise ProtocolError(f"write races with in-flight access to {ref}")
++        leases = self._active_leases(ref)
++        if leases:
++            lease = leases[0]
++            raise ProtocolError(
++                f"slot/source reuse before ACK acquire: {ref}, epoch {lease.epoch}, lease {lease.kind} for rank {lease.consumer}"
++            )
++
++    def _check_read(self, ref, rank):
++        buffer = self._buffer(ref)
++        if buffer.writers:
++            raise ProtocolError(f"read before local completion or payload arrival: {ref}")
++        for lease in self._leases.values():
++            if lease.ref != ref:
++                continue
++            if lease.ack_acquired and lease.version != buffer.version:
++                continue
++            if lease.kind == "put" and lease.consumer == rank:
++                if not lease.acquired:
++                    raise ProtocolError(f"read without READY acquire/covers: {ref}, epoch {lease.epoch}")
++                if lease.ack_sent:
++                    raise ProtocolError(f"read after ACK released consumer lease: {ref}")
++                if lease.version != buffer.version:
++                    raise ProtocolError(f"wrong payload generation in {ref}: expected version {lease.version}, observed {buffer.version}")
++
++    def _store(self, ref, data):
++        buffer = self._buffer(ref)
++        array = np.asarray(data)
++        if array.shape != buffer.data.shape or array.dtype != buffer.data.dtype:
++            raise ProtocolError(
++                f"shape/dtype mismatch for {ref}: expected {buffer.data.shape}/{buffer.data.dtype}, got {array.shape}/{array.dtype}"
++            )
++        buffer.data[...] = array
++        buffer.version += 1
++
++    def _new_lease(self, kind, ref, publisher, consumer, epoch, version=None):
++        lease = _Lease(len(self._leases) + 1, kind, ref, publisher, consumer, epoch, version)
++        self._leases[lease.id] = lease
++        self._trace("lease_open", publisher, region=str(ref), kind=kind, consumer=consumer, epoch=epoch)
++        return lease
++
++    def _reserve_signal(self, rank, ref, value):
++        self._check_epoch(value)
++        if ref.rank == rank:
++            raise ProtocolError("signal must target a remote rank")
++        signal = self._signal(ref)
++        if signal.writer not in (None, rank):
++            raise ProtocolError(f"signal has multiple writers: {ref}")
++        if value <= signal.issued:
++            raise ProtocolError(f"signal epoch must increase: {ref}, {value} <= {signal.issued}")
++        signal.writer, signal.issued = rank, value
++
++    def _use_fault(self, kind, rank, **details):
++        if self.fault == kind and not self._fault_used:
++            self._fault_used = True
++            self._trace("fault_injected", rank, fault=kind, **details)
++            return True
++        return False
++
++    def _send_signal(self, rank, ref, value, publications, acknowledgements, event, delay=None):
++        # Signals in one channel are ordered by the prefix dependency. Publication
++        # metadata belongs to the signal value actually observed, not to history.
++        if (self._use_fault("drop_ack", rank, signal=str(ref)) if acknowledgements else False) or self._use_fault(
++            "drop_signal", rank, signal=str(ref)
++        ):
++            return
++
++        def deliver():
++            signal = self._signal(ref)
++            if value <= signal.value:
++                raise ProtocolError(f"signal delivery regressed: {ref}")
++            signal.value = value
++            signal.publications = tuple(publications)
++            signal.acknowledgements = tuple(acknowledgements)
++            event.local_done = event.remote_done = event.payload_done = True
++            self._trace(
++                "signal_arrive",
++                rank,
++                destination=str(ref),
++                epoch=value,
++                publications=list(publications),
++                acknowledgements=list(acknowledgements),
++            )
++            for lease_id in publications:
++                lease = self._leases[lease_id]
++                if lease.version is None or self._buffer(lease.ref).writers:
++                    raise ProtocolError(f"READY arrived before payload completion: {lease.ref}")
++
++        self._trace("signal_issue", rank, destination=str(ref), epoch=value)
++        self._schedule(self._delay() if delay is None else delay, deliver)
++
++    def _copy(self, rank, op, signal_op=None):
++        src, dst = op.src, op.dst
++        if src.rank == dst.rank or rank not in (src.rank, dst.rank):
++            raise ProtocolError("copy must cross ranks and be issued by source (put) or destination (get)")
++        kind = "put" if src.rank == rank else "get"
++        source, destination = self._buffer(src), self._buffer(dst)
++        if source.data.shape != destination.data.shape or source.data.dtype != destination.data.dtype:
++            raise ProtocolError("copy shape/dtype mismatch")
++        self._check_read(src, rank)
++        self._check_write(dst)
++        lease = None
++        if kind == "get":
++            candidates = [
++                x for x in self._active_leases(src) if x.kind == "get_source" and x.consumer == rank and x.acquired and not x.ack_sent
++            ]
++            if len(candidates) != 1 or candidates[0].version != source.version:
++                raise ProtocolError(f"get requires an acquired, stable source lease: {src}")
++            lease = candidates[0]
++        prefix = self._prefix(rank)
++        if signal_op is not None:
++            if kind != "put" or signal_op.signal.rank != dst.rank:
++                raise ProtocolError("put_signal must publish to the destination rank")
++            self._reserve_signal(rank, signal_op.signal, signal_op.value)
++        if kind == "put":
++            # An unbound publication lease begins at issue, before READY exists.
++            # Remote completion alone never authorizes receiver consumption.
++            lease = self._new_lease("put", dst, rank, dst.rank, signal_op.value if signal_op is not None else None)
++        event = self._event(rank, kind, src=src, dst=dst, lease=lease.id if lease else None)
++        source.readers.add(event.id)
++        destination.writers.add(event.id)
++        self._trace(f"{kind}_issue", rank, event=event.id, source=str(src), destination=str(dst))
++        staging = {}
++
++        def snapshot():
++            staging["data"] = source.data.copy()
++            if self._use_fault("corrupt_payload", rank, event=event.id):
++                flat = staging["data"].reshape(-1)
++                if flat.size:
++                    if flat.dtype == np.dtype("uint16"):
++                        flat[0] = 0x4040 if flat[0] == 0x4000 else 0x4000
++                    else:
++                        flat[0] += 2
++            source.readers.remove(event.id)
++
++        def local_complete():
++            snapshot()
++            event.local_done = True
++            self._trace("local_complete", rank, event=event.id, kind=kind)
++
++        def payload_complete():
++            if kind == "get":
++                snapshot()
++            self._store(dst, staging["data"])
++            destination.writers.remove(event.id)
++            event.payload_done = True
++            if kind == "get":
++                event.local_done = True
++                lease.consumed = True
++                self._trace("local_complete", rank, event=event.id, kind=kind)
++            elif signal_op is None:
++                event.remote_done = True
++            if kind == "put":
++                lease.version = destination.version
++            self._trace("payload_arrive", rank, event=event.id, destination=str(dst), version=destination.version)
++
++        local_delay = self._delay()
++        if kind == "put":
++            self._schedule(local_delay, local_complete)
++        self._schedule(local_delay + self._delay(), payload_complete)
++        if signal_op is not None:
++            early = self._use_fault("early_ready", rank, event=event.id)
++            ready = lambda: early or (event.payload_done and all(self._complete(e) for e in prefix))
++
++            def publish():
++                publications = self._bind_put_publications(prefix, dst.rank, signal_op.value)
++                self._send_signal(rank, signal_op.signal, signal_op.value, [*publications, lease.id], [], event, delay=0 if early else None)
++
++            self._deferred.append((ready, publish))
++        return event
++
++    def _bind_put_publications(self, prefix, peer, epoch):
++        publications = []
++        for event in prefix:
++            if event.kind == "put" and event.dst.rank == peer:
++                lease = self._leases[event.lease]
++                if lease.epoch is None:
++                    lease.epoch = epoch
++                    publications.append(lease.id)
++        return publications
++
++    def _issue_signal(self, rank, op):
++        self._reserve_signal(rank, op.ref, op.value)
++        publications, acknowledgements = [], []
++        for ref in op.release_regions:
++            if ref.rank != rank:
++                raise ProtocolError("release_regions must be local")
++            buffer = self._buffer(ref)
++            incoming = [
++                x
++                for x in self._active_leases(ref)
++                if x.kind == "put"
++                and x.consumer == rank
++                and x.publisher == op.ref.rank
++                and x.epoch == op.value
++                and x.acquired
++                and not x.ack_sent
++            ]
++            if incoming:
++                acknowledgements.extend(x.id for x in incoming)
++            else:
++                if self._active_leases(ref):
++                    raise ProtocolError(f"cannot republish a leased source or acknowledge an unacquired payload: {ref}")
++                publications.append(self._new_lease("get_source", ref, rank, op.ref.rank, op.value, buffer.version).id)
++        # Completed get requests release the acquired remote source through a
++        # control-only ACK; local destination computation does not hold that source.
++        acknowledgements.extend(
++            x.id
++            for x in self._leases.values()
++            if x.kind == "get_source"
++            and x.consumer == rank
++            and x.publisher == op.ref.rank
++            and x.epoch == op.value
++            and x.acquired
++            and x.consumed
++            and not x.ack_sent
++            and not x.ack_acquired
++        )
++        # Publish any earlier plain puts to this peer, even when their local wait
++        # has already returned. This is the release-prefix rule for covers=[Recv].
++        publications.extend(self._bind_put_publications(self._prefix(rank), op.ref.rank, op.value))
++        for lease_id in acknowledgements:
++            lease = self._leases[lease_id]
++            if self._buffer(lease.ref).readers:
++                raise ProtocolError(f"ACK before consumer/source reads complete: {lease.ref}")
++            lease.ack_sent = True
++        event = self._event(rank, "signal")
++        self._send_signal(rank, op.ref, op.value, publications, acknowledgements, event)
++
++    def _acquire(self, rank, op):
++        signal = self._signal(op.ref)
++        self._check_epoch(op.value)
++        if op.ref.rank != rank:
++            raise ProtocolError("wait_signal must target a local signal")
++        if signal.value < op.value:
++            return False
++        for ref in op.covers:
++            candidates = [self._leases[i] for i in signal.publications if self._leases[i].ref == ref and self._leases[i].consumer == rank]
++            if len(candidates) != 1:
++                raise ProtocolError(f"covers has no matching release publication: {ref}")
++            lease, buffer = candidates[0], self._buffer(ref)
++            # >= is sufficient for control waits. Covered reusable slots must not
++            # silently substitute a newer generation for the requested one.
++            if lease.epoch != op.value:
++                raise ProtocolError(f"wrong payload epoch for {ref}: requested {op.value}, observed {lease.epoch}")
++            if lease.ack_sent or lease.ack_acquired:
++                raise ProtocolError(f"acquire after payload lease was acknowledged: {ref}")
++            if lease.version is None or buffer.writers:
++                raise ProtocolError(f"READY arrived before payload completion: {ref}")
++            if lease.version != buffer.version:
++                raise ProtocolError(f"wrong payload generation: {ref}")
++            lease.acquired = True
++        for lease_id in signal.acknowledgements:
++            lease = self._leases[lease_id]
++            if lease.publisher != rank:
++                raise ProtocolError("ACK acquired by wrong publisher")
++            lease.ack_acquired = True
++            self._trace("lease_close", rank, region=str(lease.ref), epoch=lease.epoch)
++        self._trace(
++            "signal_acquire",
++            rank,
++            signal=str(op.ref),
++            requested_epoch=op.value,
++            observed_epoch=signal.value,
++            covers=[str(r) for r in op.covers],
++        )
++        return True
++
++    def _compute(self, rank, op):
++        if not isinstance(op.ticks, int) or op.ticks < 1:
++            raise ProtocolError("compute ticks must be positive")
++        if len(set(op.writes)) != len(op.writes):
++            raise ProtocolError("compute writes must be distinct regions")
++        for ref in (*op.reads, *op.writes):
++            if ref.rank != rank:
++                raise ProtocolError("compute accesses must be local")
++        for ref in op.reads:
++            self._check_read(ref, rank)
++        for ref in op.writes:
++            self._check_write(ref)
++        event = self._event(rank, "compute")
++        snapshots = [self._buffer(ref).data.copy() for ref in op.reads]
++        for ref in op.reads:
++            self._buffer(ref).readers.add(event.id)
++        for ref in op.writes:
++            self._buffer(ref).writers.add(event.id)
++        self._trace(
++            "compute_begin", rank, event=event.id, operation=op.name, reads=[str(r) for r in op.reads], writes=[str(r) for r in op.writes]
++        )
++
++        def finish():
++            values = op.callback(*snapshots)
++            if not isinstance(values, (tuple, list)) or len(values) != len(op.writes):
++                raise ProtocolError("compute callback must return one tuple/list entry per write region")
++            # Validate before mutating any destination.
++            for ref, value in zip(op.writes, values):
++                buffer, array = self._buffer(ref), np.asarray(value)
++                if array.shape != buffer.data.shape or array.dtype != buffer.data.dtype:
++                    raise ProtocolError(f"compute shape/dtype mismatch for {ref}")
++            for ref in op.reads:
++                self._buffer(ref).readers.discard(event.id)
++                for lease in self._active_leases(ref):
++                    if lease.kind == "put" and lease.consumer == rank:
++                        lease.consumed = True
++            for ref, value in zip(op.writes, values):
++                self._buffer(ref).writers.remove(event.id)
++                self._store(ref, value)
++            event.local_done = event.remote_done = event.payload_done = True
++            self._trace("compute_end", rank, event=event.id, operation=op.name)
++
++        self._schedule(op.ticks, finish)
++        return event
++
++    def _wait_ready(self, rank, op):
++        if isinstance(op, Wait):
++            event = op.event
++            if self._events.get(event.id) is not event or event.rank != rank:
++                raise ProtocolError("event does not belong to the waiting rank/run")
++            if op.completion not in ("local", "remote"):
++                raise ProtocolError("completion must be local or remote")
++            if op.completion == "remote" and event.kind in ("get", "compute"):
++                raise ProtocolError(f"{event.kind} does not support remote completion")
++            ready = event.local_done if op.completion == "local" else event.remote_done
++            if ready:
++                self._trace("event_wait", rank, event=event.id, completion=op.completion)
++            return ready
++        if isinstance(op, WaitSignal):
++            return self._acquire(rank, op)
++        if isinstance(op, Signal):
++            if all(self._complete(e) for e in self._prefix(rank)) and all(
++                not self._buffer(ref).readers and not self._buffer(ref).writers for ref in op.release_regions
++            ):
++                self._issue_signal(rank, op)
++                return True
++            return False
++        if isinstance(op, Quiet):
++            return all(self._complete(e) for e in self._prefix(rank))
++        if isinstance(op, Delay):
++            return self.now >= self._ranks[rank].result
++        raise ProtocolError(f"unsupported blocking operation: {op!r}")
++
++    def _execute(self, rank, op):
++        state = self._ranks[rank]
++        if isinstance(op, Write):
++            if op.ref.rank != rank:
++                raise ProtocolError("Write requires a local region")
++            self._check_write(op.ref)
++            self._store(op.ref, op.data)
++            self._trace("write", rank, region=str(op.ref), version=self._buffer(op.ref).version)
++        elif isinstance(op, (CopyAsync, PutSignal)):
++            state.result = self._copy(rank, op, op if isinstance(op, PutSignal) else None)
++        elif isinstance(op, Compute):
++            state.result = self._compute(rank, op)
++        elif isinstance(op, (Wait, WaitSignal, Signal, Quiet, Delay)):
++            if isinstance(op, Delay):
++                if not isinstance(op.ticks, int) or op.ticks < 0:
++                    raise ProtocolError("delay ticks must be nonnegative")
++                state.result = self.now + op.ticks
++                self._schedule(op.ticks, lambda: None)
++            if not self._wait_ready(rank, op):
++                state.blocked = op
++            else:
++                state.result = None
++        else:
++            raise ProtocolError(f"unsupported operation from rank {rank}: {op!r}")
++
++    def _flush(self):
++        progressed = True
++        while progressed:
++            progressed = False
++            while self._queue and self._queue[0][0] <= self.now:
++                _, _, callback = heapq.heappop(self._queue)
++                callback()
++                progressed = True
++            waiting = []
++            for ready, callback in self._deferred:
++                if ready():
++                    callback()
++                    progressed = True
++                else:
++                    waiting.append((ready, callback))
++            self._deferred = waiting
++
++    def run(self, programs: Mapping[int, Generator]):
++        if self._ran:
++            raise ValueError("Simulator instances support one run; create a new run for a fresh epoch namespace")
++        self._ran = True
++        self._ranks = {rank: _Rank(program) for rank, program in sorted(programs.items())}
++        try:
++            for step in range(self.max_steps):
++                self._flush()
++                progressed = False
++                for rank, state in self._ranks.items():
++                    if state.done:
++                        continue
++                    if state.blocked is not None:
++                        if not self._wait_ready(rank, state.blocked):
++                            continue
++                        state.blocked, state.result = None, None
++                    try:
++                        op = state.program.send(state.result) if state.started else next(state.program)
++                        state.started, state.result = True, None
++                        self._execute(rank, op)
++                    except StopIteration:
++                        state.done = True
++                        self._trace("rank_end", rank)
++                    progressed = True
++                if all(s.done for s in self._ranks.values()):
++                    pending = [e.id for e in self._events.values() if not self._complete(e)]
++                    leases = [x.id for x in self._leases.values() if not x.ack_acquired]
++                    if pending or leases:
++                        raise ProtocolError(f"run exited without drain/ACK: pending events={pending}, leases={leases}")
++                    self._passed = True
++                    return self.report()
++                if progressed:
++                    self.now += 1
++                elif self._queue:
++                    self.now = max(self.now, self._queue[0][0])
++                else:
++                    blocked = {r: repr(s.blocked) for r, s in self._ranks.items() if not s.done}
++                    raise DeadlockError(f"no future event can advance blocked ranks: {blocked}")
++            raise ProtocolError(f"step budget exhausted ({self.max_steps}); possible livelock")
++        except Exception as error:
++            self._error = f"{type(error).__name__}: {error}"
++            self._trace("failure", -1, error=self._error)
++            raise
++
++    def read_buffer(self, ref):
++        """Return an isolated inspection snapshot; kernel reads use Compute."""
++        return self._buffer(ref).data.copy()
++
++    def report(self):
++        return {
++            "passed": self._passed,
++            "mode": "cpu_rank_protocol_model",
++            "seed": self.seed,
++            "logical_ticks": self.now,
++            "time_unit": "logical_tick_no_physical_unit",
++            "fault": self.fault,
++            "fault_injected": self._fault_used,
++            "error": self._error,
++            "events": len(self._events),
++            "trace_events": len(self.trace_events),
++            "pending_events": [e.id for e in self._events.values() if not self._complete(e)],
++            "open_leases": [x.id for x in self._leases.values() if not x.ack_acquired],
++            "ranks": {str(r): {"done": s.done, "blocked": repr(s.blocked) if s.blocked else None} for r, s in self._ranks.items()},
++        }
+diff --git a/cosim/runtime.py b/cosim/runtime.py
+new file mode 100644
+index 0000000..7f6ebdf
+--- /dev/null
++++ b/cosim/runtime.py
+@@ -0,0 +1,38 @@
++"""Explicit off-only bridge to the pinned helper's original runtime API.
++
++The P0 pure-Cube companion does not contain, load, or certify a MIX scheduler
++repair. Keep this boundary explicit instead of importing unrelated local fixes.
++"""
++
++from utils.execution import record_environment as _record_environment
++
++
++def prepare_mix_scheduler_fix(cann_home, mode, blocks, expected_cores):
++    """Record the absence of a scheduler repair; reject unsupported modes."""
++    if mode != "off":
++        raise ValueError("P0 companion supports only mix_scheduler_fix='off'")
++    return {
++        "mode": "off",
++        "apply": False,
++        "reason": "P0 pure-Cube companion; no MIX scheduler repair included",
++        "blocks": blocks,
++        "mixed": any(core.startswith("AIV") for core in expected_cores),
++        "verification": {"status": "not_applied"},
++    }
++
++
++def _require_off(fix):
++    if not isinstance(fix, dict) or fix.get("mode") != "off" or fix.get("apply") is not False:
++        raise ValueError("P0 companion cannot apply or validate a MIX scheduler repair")
++
++
++def record_environment(cann_home, run_dir, mix_scheduler_fix):
++    """Use the pinned helper's ordinary simulator environment without a shim."""
++    _require_off(mix_scheduler_fix)
++    return _record_environment(cann_home, run_dir)
++
++
++def validate_mix_scheduler_fix(fix, run_dir, blocks):
++    """Only confirm that no repair was requested; never claim MIX validation."""
++    _require_off(fix)
++    return {"passed": True, "status": "not_applied", "report": None}
+diff --git a/cosim/segments.py b/cosim/segments.py
+new file mode 100644
+index 0000000..35d1bee
+--- /dev/null
++++ b/cosim/segments.py
+@@ -0,0 +1,253 @@
++"""One fresh CANN process per fixed-size GEMM segment of a functional co-simulation.
++
++Communication and inter-rank ordering belong to the host-side protocol model.
++This adapter evaluates only a single 64x64 BF16 GEMM on the single-device CANN
++Simulator and preserves its ordinary accuracy and Core 0 trace checks.
++This companion supports only the explicit MIX scheduler fix mode "off".
++"""
++
++import copy
++import math
++import os
++from pathlib import Path
++import re
++import shutil
++import signal
++import subprocess
++import sys
++import tempfile
++import time
++from types import SimpleNamespace
++
++import numpy as np
++
++from cases.gemm import GemmCase
++from utils.accuracy import check_output, load_inputs
++from utils.environment import SOC_VERSION
++from utils.execution import build_runner, isolate_runner
++from utils.generate_report import export_traces
++from utils.io import sha256, write_json
++from cosim.runtime import prepare_mix_scheduler_fix, record_environment, validate_mix_scheduler_fix
++
++
++class SegmentExecutionError(RuntimeError):
++    """A segment failed; its diagnostics remain available in its manifest."""
++
++    def __init__(self, manifest):
++        self.manifest = manifest
++        self.manifest_path = Path(manifest["manifest_path"])
++        reasons = manifest.get("errors", [])
++        super().__init__(f"rank {manifest['rank']} segment {manifest['segment_id']} failed: {'; '.join(reasons)}; see {self.manifest_path}")
++
++
++class GemmSegmentExecutor:
++    """Build once, then run independent, bounded one-launch GEMM recordings.
++
++    ``execute`` accepts raw little-endian BF16 ``uint16`` arrays, both [64,64],
++    and returns the actual [64,64] FP32 simulator output. Every attempted launch
++    appends a final manifest to ``reports``, including unsuccessful recordings.
++    Segment IDs identify work in the protocol model and must be filesystem-safe.
++    The caller must serialize calls; concurrent simulator execution is not used.
++    """
++
++    def __init__(self, kernel, run_dir, cann_home, mix_scheduler_fix="off", rtol=1e-5, atol=1e-5, timeout_seconds=120, expected_cores=None):
++        if min(rtol, atol) < 0 or not all(math.isfinite(x) for x in (rtol, atol)):
++            raise ValueError("tolerances must be finite and non-negative")
++        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
++            raise ValueError("segment timeout must be finite and positive")
++        self.kernel = Path(kernel).expanduser().resolve()
++        if not self.kernel.is_file():
++            raise ValueError(f"kernel object not found: {self.kernel}")
++        self.run_dir = Path(run_dir).expanduser().resolve()
++        self.cann_home = Path(cann_home).expanduser().resolve()
++        self.rtol, self.atol = rtol, atol
++        self.timeout_seconds = timeout_seconds
++        self.operator = GemmCase()
++        if expected_cores is not None:
++            cores = frozenset(expected_cores)
++            if not cores or not cores <= {"AIC", "AIV0", "AIV1"} or "AIC" not in cores:
++                raise ValueError("GEMM expected_cores must include AIC and only valid subcores")
++            self.operator.expected_cores = cores
++        self.config = SimpleNamespace(kind="gemm", seq_len=64, blocks=1)
++        self.reports = []
++        self.kernel_sha256 = sha256(self.kernel)
++        self.run_dir.mkdir(parents=True, exist_ok=True)
++        self.segment_dir = self.run_dir / "segments"
++        self.segment_dir.mkdir(exist_ok=True)
++        self.runner_source = Path(build_runner(self.cann_home, self.operator.runner_target)).resolve()
++        # Keep the built Host stable if another invocation rebuilds the shared build/.
++        self.build_snapshot = Path(tempfile.mkdtemp(prefix="segment_host_", dir=self.run_dir))
++        self.runner_snapshot = self.build_snapshot / self.runner_source.name
++        shutil.copy2(self.runner_source, self.runner_snapshot)
++        self.runner_sha256 = sha256(self.runner_snapshot)
++        self._mix_fix_template = prepare_mix_scheduler_fix(
++            self.cann_home, mix_scheduler_fix, self.config.blocks, self.operator.expected_cores
++        )
++
++    def execute(self, rank, segment_id, a_bits, b_bits):
++        """Run one GEMM and fail closed on recording, accuracy, repair, or trace errors."""
++        if type(rank) is not int or rank < 0:
++            raise ValueError("rank must be a non-negative integer")
++        if not isinstance(segment_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,95}", segment_id):
++            raise ValueError("segment_id must be 1–96 filesystem-safe letters/digits/_.- and start with a letter or digit")
++        inputs = {"a": a_bits, "b": b_bits}
++        for name, value in inputs.items():
++            if not isinstance(value, np.ndarray) or value.shape != (64, 64) or value.dtype != np.dtype("<u2"):
++                raise ValueError(f"{name} must contain raw little-endian BF16 uint16 bits with shape (64, 64)")
++        run_dir = Path(tempfile.mkdtemp(prefix=f"rank{rank}_{segment_id}_", dir=self.segment_dir))
++        data_dir = run_dir / "inputs"
++        data_dir.mkdir()
++        for name, value in inputs.items():
++            np.ascontiguousarray(value).tofile(data_dir / f"{name}.bin")
++        input_hashes = {name: sha256(data_dir / f"{name}.bin") for name in inputs}
++        write_json(
++            data_dir / "inputs.json",
++            {
++                "kind": "gemm",
++                "seq_len": 64,
++                "rank": rank,
++                "segment_id": segment_id,
++                "source": "host protocol model segment boundary",
++                "files": {f"{name}.bin": {"shape": [64, 64], "dtype": "<u2", "sha256": digest} for name, digest in input_hashes.items()},
++            },
++        )
++        # record_environment mutates loaded-library fields; no previous segment's
++        # paths or verification result may be reused in a subsequent recording.
++        mix_fix = copy.deepcopy(self._mix_fix_template)
++        output_file = run_dir / "gemm_output.bin"
++        manifest_path = run_dir / "manifest.json"
++        manifest = {
++            "kind": "gemm",
++            "seq_len": 64,
++            "blocks": 1,
++            "rank": rank,
++            "segment_id": segment_id,
++            "run_dir": str(run_dir),
++            "manifest_path": str(manifest_path),
++            "execution_model": "single-device CANN segment",
++            "kernel": str(self.kernel),
++            "kernel_sha256": self.kernel_sha256,
++            "soc": SOC_VERSION,
++            "recorded_core": 0,
++            "expected_cores": sorted(self.operator.expected_cores),
++            "instruction_log": str(run_dir / "instructions.bin"),
++            "runner_source": str(self.runner_source),
++            "runner_snapshot": str(self.runner_snapshot),
++            "runner_sha256": self.runner_sha256,
++            "output": str(output_file),
++            "output_shape": [64, 64],
++            "data_dir": str(data_dir),
++            "python": sys.executable,
++            "python_version": sys.version.split()[0],
++            "cann_home": str(self.cann_home),
++            "input_sha256": input_hashes,
++            "timeout_seconds": self.timeout_seconds,
++            "record_timed_out": False,
++            "record_interrupted": False,
++            "record_returncode": None,
++            "record_command": [],
++            "accuracy": {"status": "pending"},
++            "report_complete": False,
++            "mix_scheduler_fix": mix_fix,
++            "passed": False,
++            "errors": [],
++        }
++        write_json(manifest_path, manifest)
++        start = time.monotonic()
++        manifest["record_started_unix_ns"] = time.time_ns()
++        try:
++            # Reject invalid BF16 values before entering the native runner.
++            load_inputs(data_dir, self.operator, self.config)
++            if sha256(self.kernel) != self.kernel_sha256:
++                raise ValueError("kernel object changed after executor initialization")
++            runner = isolate_runner(self.runner_snapshot, run_dir)
++            if sha256(runner) != self.runner_sha256:
++                raise ValueError("runner snapshot changed after executor initialization")
++            environment = record_environment(self.cann_home, run_dir, mix_fix)
++            command = [
++                str(runner),
++                "--kernel",
++                str(self.kernel),
++                "--kind",
++                "gemm",
++                "--seq-len",
++                "64",
++                "--blocks",
++                "1",
++                "--output",
++                str(output_file),
++                "--data-dir",
++                str(data_dir),
++            ]
++            manifest.update(runner=str(runner), record_command=command)
++            write_json(manifest_path, manifest)
++            with (run_dir / "record.log").open("w") as log:
++                process = subprocess.Popen(
++                    command, cwd=runner.parent, env=environment, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
++                )
++                try:
++                    manifest["record_returncode"] = process.wait(timeout=self.timeout_seconds)
++                except subprocess.TimeoutExpired:
++                    manifest["record_timed_out"] = True
++                    # End the entire process group, including simulator subprocesses.
++                    # A new session ensures the parent's shell and other ranks are excluded.
++                    try:
++                        os.killpg(process.pid, signal.SIGKILL)
++                    except ProcessLookupError:
++                        pass
++                    manifest["record_returncode"] = process.wait()
++                    manifest["errors"].append(f"recording exceeded {self.timeout_seconds:g} seconds")
++                except BaseException as error:
++                    try:
++                        os.killpg(process.pid, signal.SIGKILL)
++                    except ProcessLookupError:
++                        pass
++                    manifest["record_returncode"] = process.wait()
++                    manifest["record_interrupted"] = True
++                    manifest["errors"].append(f"recording interrupted: {type(error).__name__}")
++                    raise
++            if manifest["record_returncode"] != 0:
++                manifest["errors"].append(f"runner exited with status {manifest['record_returncode']}")
++        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
++            manifest["errors"].append(f"recording failed: {error}")
++            with (run_dir / "record.log").open("a") as log:
++                log.write(f"ERROR: {error}\n")
++        finally:
++            manifest["record_seconds"] = time.monotonic() - start
++            manifest["record_finished_unix_ns"] = time.time_ns()
++            if manifest["record_interrupted"]:
++                # Keep the interruption evidence even though the worker exits
++                # before running the ordinary accuracy/trace finalization.
++                write_json(manifest_path, manifest)
++
++        try:
++            mix_verification = validate_mix_scheduler_fix(mix_fix, run_dir, self.config.blocks)
++        except (OSError, ValueError, KeyError, TypeError) as error:
++            mix_verification = {"passed": False, "status": "failed", "error": str(error)}
++        mix_fix["verification"] = mix_verification
++        if not mix_verification["passed"]:
++            manifest["errors"].append(f"MIX validation failed: {mix_verification.get('error', 'incomplete evidence')}")
++        try:
++            accuracy = check_output(data_dir, output_file, self.operator, self.config, self.rtol, self.atol)
++            manifest["output_sha256"] = accuracy["output_sha256"]
++        except (OSError, ValueError, KeyError) as error:
++            accuracy = {"passed": False, "error": str(error)}
++        manifest["accuracy"] = accuracy
++        if not accuracy["passed"]:
++            manifest["errors"].append(f"accuracy failed: {accuracy.get('error', str(accuracy.get('mismatches')) + ' mismatches')}")
++        write_json(run_dir / "accuracy.json", accuracy)
++        write_json(manifest_path, manifest)
++        # Even timeout, native failure, or wrong output must retain available traces.
++        try:
++            report = export_traces(run_dir, self.operator.expected_cores)
++        except (OSError, ValueError, subprocess.SubprocessError) as error:
++            report = {"report_complete": False, "report_error": str(error)}
++        manifest.update(report)
++        if not report["report_complete"]:
++            manifest["errors"].append(f"trace failed: {report.get('report_error', 'incomplete trace')}")
++        manifest["passed"] = not manifest["errors"] and manifest["record_returncode"] == 0 and not manifest["record_timed_out"]
++        write_json(manifest_path, manifest)
++        self.reports.append(manifest)
++        if not manifest["passed"]:
++            raise SegmentExecutionError(manifest)
++        return np.fromfile(output_file, dtype="<f4").reshape(64, 64)
+diff --git a/cosim/worker.py b/cosim/worker.py
+new file mode 100644
+index 0000000..c327b9e
+--- /dev/null
++++ b/cosim/worker.py
+@@ -0,0 +1,80 @@
++"""JSON-lines bridge for compilers using a different Python interpreter.
++
++The worker uses the helper's own environment and never executes supplied code.
++Diagnostics go to stderr; stdout contains one JSON response per request.
++"""
++
++import argparse
++import json
++import os
++from pathlib import Path
++import signal
++import sys
++
++import numpy as np
++
++from cosim.segments import GemmSegmentExecutor
++from utils.environment import prepare_environment
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--kernel", required=True, type=Path)
++    parser.add_argument("--run-dir", required=True, type=Path)
++    parser.add_argument("--expected-cores", nargs="+", required=True)
++    parser.add_argument("--timeout", type=float, default=120)
++    args = parser.parse_args()
++    # Python's redirect_stdout cannot redirect CMake or native library writes.
++    # Keep a private pipe descriptor for the protocol and move fd 1 to stderr
++    # before constructing the executor, whose build spawns native subprocesses.
++    sys.stdout.flush()
++    wire_fd = os.dup(1)
++    os.set_inheritable(wire_fd, False)
++    os.dup2(2, 1)
++
++    def terminate(signum, _frame):
++        # Let the executor's BaseException path kill its independently created
++        # native process group before this worker exits.
++        raise SystemExit(128 + signum)
++
++    signal.signal(signal.SIGTERM, terminate)
++    with os.fdopen(wire_fd, "w", encoding="utf-8", buffering=1) as wire:
++
++        def respond(value):
++            print(json.dumps(value, allow_nan=False), file=wire, flush=True)
++
++        try:
++            executor = GemmSegmentExecutor(
++                args.kernel, args.run_dir, prepare_environment(), expected_cores=args.expected_cores, timeout_seconds=args.timeout
++            )
++            respond({"ready": True})
++        except Exception as error:
++            respond({"ready": False, "error": f"{type(error).__name__}: {error}"})
++            return 1
++        for line in sys.stdin:
++            try:
++                request = json.loads(line)
++                if not isinstance(request, dict):
++                    raise ValueError("request must be a JSON object")
++                if request.get("op") == "close":
++                    return 0
++                if request.get("op") != "execute":
++                    raise ValueError("expected execute or close")
++                a = np.fromfile(request["a"], dtype="<u2").reshape(64, 64)
++                b = np.fromfile(request["b"], dtype="<u2").reshape(64, 64)
++                count = len(executor.reports)
++                try:
++                    executor.execute(request["rank"], request["segment_id"], a, b)
++                    response = {"passed": True, "manifest": executor.reports[-1]}
++                except Exception as error:
++                    response = {"passed": False, "error": str(error)}
++                    if len(executor.reports) > count:
++                        response["manifest"] = executor.reports[-1]
++            except Exception as error:
++                response = {"passed": False, "error": f"{type(error).__name__}: {error}"}
++            respond(response)
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tests/test_cosim_protocol.py b/tests/test_cosim_protocol.py
+new file mode 100644
+index 0000000..a7fba9f
+--- /dev/null
++++ b/tests/test_cosim_protocol.py
+@@ -0,0 +1,559 @@
++"""Executable READY/ACK protocols and adversarial counterexamples (no CANN)."""
++
++from pathlib import Path
++import sys
++import unittest
++
++import numpy as np
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++from cosim.protocol import (
++    BufferRef,
++    Compute,
++    CopyAsync,
++    DeadlockError,
++    Delay,
++    ProtocolError,
++    PutSignal,
++    Quiet,
++    Signal,
++    SignalRef,
++    Simulator,
++    Wait,
++    WaitSignal,
++    Write,
++)
++
++
++def array(value):
++    return np.full((2, 2), value, dtype=np.float32)
++
++
++def exchange(seed=0, rounds=4, slots=2, fault=None, consumer_ticks=3):
++    sim = Simulator(seed=seed, fault=fault)
++    for rank in range(2):
++        for slot in range(slots):
++            sim.register_buffer(BufferRef(rank, "send", slot), array(-1))
++            sim.register_buffer(BufferRef(rank, "recv", slot), array(-2))
++            sim.register_signal(SignalRef(rank, "ready", slot))
++            sim.register_signal(SignalRef(rank, "ack", slot))
++        sim.register_buffer(BufferRef(rank, "out"), array(0))
++    seen = {0: [], 1: []}
++
++    def program(rank):
++        peer = 1 - rank
++        for iteration in range(rounds):
++            slot, epoch = iteration % slots, iteration + 1
++            send, recv = BufferRef(rank, "send", slot), BufferRef(rank, "recv", slot)
++            if iteration >= slots:
++                yield WaitSignal(SignalRef(rank, "ack", slot), epoch - slots)
++            yield Write(send, array(100 * rank + epoch))
++            event = yield PutSignal(send, BufferRef(peer, "recv", slot), SignalRef(peer, "ready", slot), epoch)
++            yield Wait(event)
++            yield WaitSignal(SignalRef(rank, "ready", slot), epoch, (recv,))
++
++            def consume(data, r=rank, e=epoch):
++                seen[r].append(data.copy())
++                np.testing.assert_array_equal(data, array(100 * (1 - r) + e))
++                return (data.copy(),)
++
++            event = yield Compute("consumer", (recv,), (BufferRef(rank, "out"),), consume, ticks=consumer_ticks + rank)
++            # Deliberately omit Wait: ACK's release_regions must join this reader.
++            yield Signal(SignalRef(peer, "ack", slot), epoch, (recv,))
++        for slot in range(min(slots, rounds)):
++            last = max(i + 1 for i in range(rounds) if i % slots == slot)
++            yield WaitSignal(SignalRef(rank, "ack", slot), last)
++        yield Quiet()
++
++    sim.run({0: program(0), 1: program(1)})
++    return sim, seen
++
++
++class ProtocolTests(unittest.TestCase):
++    def setup_pair(self, **kwargs):
++        sim = Simulator(**kwargs)
++        src, dst = BufferRef(0, "source"), BufferRef(1, "recv")
++        ready, ack = SignalRef(1, "ready"), SignalRef(0, "ack")
++        sim.register_buffer(src, array(1))
++        sim.register_buffer(dst, array(0))
++        sim.register_buffer(BufferRef(1, "out"), array(0))
++        sim.register_signal(ready)
++        sim.register_signal(ack)
++        return sim, src, dst, ready, ack
++
++    def receiver(self, dst, ready, ack, value=1, delay=0):
++        if delay:
++            yield Delay(delay)
++        yield WaitSignal(ready, value, (dst,))
++        event = yield Compute("read", (dst,), (BufferRef(1, "out"),), lambda data: (data,), ticks=4)
++        yield Signal(ack, value, (dst,))
++        yield Wait(event)
++        yield Quiet()
++
++    def test_slots_and_delayed_consumers_across_seeds(self):
++        for slots in (1, 2, 3):
++            for seed in range(12):
++                with self.subTest(slots=slots, seed=seed):
++                    sim, seen = exchange(seed=seed, slots=slots, rounds=5, consumer_ticks=7)
++                    self.assertTrue(sim.report()["passed"])
++                    self.assertEqual([len(seen[r]) for r in range(2)], [5, 5])
++                    self.assertEqual(sim.report()["open_leases"], [])
++                    self.assertEqual(sim.report()["pending_events"], [])
++
++    def test_reproducible_seed(self):
++        first, _ = exchange(seed=42)
++        second, _ = exchange(seed=42)
++        self.assertEqual(first.trace_events, second.trace_events)
++        other, _ = exchange(seed=43)
++        self.assertNotEqual(first.trace_events, other.trace_events)
++
++    def test_registration_and_inspection_do_not_alias(self):
++        sim = Simulator()
++        ref, other = BufferRef(0, "x"), BufferRef(1, "x")
++        data = array(1)
++        sim.register_buffer(ref, data)
++        sim.register_buffer(other, data)
++        data[:] = 7
++        snapshot = sim.read_buffer(ref)
++        snapshot[:] = 9
++        np.testing.assert_array_equal(sim.read_buffer(ref), array(1))
++        np.testing.assert_array_equal(sim.read_buffer(other), array(1))
++
++    def test_put_local_completion_releases_source_before_remote_arrival(self):
++        sim, src, dst, ready, ack = self.setup_pair(min_delay=4, max_delay=4)
++
++        def sender():
++            event = yield PutSignal(src, dst, ready, 1)
++            yield Wait(event, "local")
++            self.assertFalse(event.remote_done)
++            yield Write(src, array(2))
++            yield WaitSignal(ack, 1)
++            yield Quiet()
++
++        sim.run({0: sender(), 1: self.receiver(dst, ready, ack)})
++        np.testing.assert_array_equal(sim.read_buffer(dst), array(1))
++        np.testing.assert_array_equal(sim.read_buffer(src), array(2))
++
++    def test_source_rewrite_before_put_local_completion_is_rejected(self):
++        sim, src, dst, ready, _ = self.setup_pair(min_delay=5, max_delay=5)
++
++        def sender():
++            yield PutSignal(src, dst, ready, 1)
++            yield Write(src, array(2))
++
++        with self.assertRaisesRegex(ProtocolError, "in-flight access"):
++            sim.run({0: sender()})
++
++    def test_release_prefix_retains_put_after_local_wait(self):
++        sim, src, dst, ready, ack = self.setup_pair(min_delay=5, max_delay=5)
++
++        def sender():
++            event = yield CopyAsync(src, dst)
++            yield Wait(event)
++            self.assertFalse(event.remote_done)
++            yield Signal(ready, 1)
++            yield WaitSignal(ack, 1)
++            yield Quiet()
++
++        sim.run({0: sender(), 1: self.receiver(dst, ready, ack)})
++        arrivals = [e["ts"] for e in sim.trace_events if e["name"] == "payload_arrive"]
++        signal = [e["ts"] for e in sim.trace_events if e["name"] == "signal_arrive" and e["args"]["destination"] == str(ready)]
++        self.assertLess(arrivals[0], signal[0])
++
++    def test_put_signal_publishes_prior_plain_put_to_same_peer(self):
++        sim, src, dst, ready, ack = self.setup_pair(min_delay=4, max_delay=4)
++        prior_dst = BufferRef(1, "prior_recv")
++        sim.register_buffer(prior_dst, array(0))
++
++        def sender():
++            yield CopyAsync(src, prior_dst)
++            yield PutSignal(src, dst, ready, 1)
++            yield WaitSignal(ack, 1)
++            yield Quiet()
++
++        def receiver():
++            yield WaitSignal(ready, 1, (prior_dst, dst))
++            event = yield Compute("consume_two", (prior_dst, dst), (BufferRef(1, "out"),), lambda first, second: (first + second,))
++            yield Wait(event)
++            yield Signal(ack, 1, (prior_dst, dst))
++            yield Quiet()
++
++        sim.run({0: sender(), 1: receiver()})
++        np.testing.assert_array_equal(sim.read_buffer(BufferRef(1, "out")), array(2))
++        self.assertEqual(sim.report()["open_leases"], [])
++
++    def test_put_signal_covers_prior_put_to_another_peer(self):
++        sim, src, dst, ready, ack = self.setup_pair(min_delay=3, max_delay=3)
++        other = BufferRef(2, "recv")
++        other_ready, other_ack = SignalRef(2, "ready"), SignalRef(0, "ack2")
++        sim.register_buffer(other, array(0))
++        sim.register_signal(other_ready)
++        sim.register_signal(other_ack)
++
++        def sender():
++            first = yield CopyAsync(src, other)
++            second = yield PutSignal(src, dst, ready, 1)
++            yield Wait(second, "remote")
++            self.assertTrue(first.remote_done)
++            yield Signal(other_ready, 1)
++            yield WaitSignal(ack, 1)
++            yield WaitSignal(other_ack, 1)
++            yield Quiet()
++
++        def other_receiver():
++            yield WaitSignal(other_ready, 1, (other,))
++            yield Signal(other_ack, 1, (other,))
++            yield Quiet()
++
++        sim.run({0: sender(), 1: self.receiver(dst, ready, ack), 2: other_receiver()})
++        np.testing.assert_array_equal(sim.read_buffer(other), array(1))
++
++    def test_plain_put_remote_completion_does_not_authorize_receiver_read(self):
++        sim, src, dst, _, _ = self.setup_pair(min_delay=1, max_delay=1)
++
++        def sender():
++            event = yield CopyAsync(src, dst)
++            yield Wait(event, "remote")
++            yield Quiet()
++
++        def receiver():
++            yield Delay(10)
++            yield Compute("missing_release_acquire", (dst,), (), lambda data: ())
++
++        with self.assertRaisesRegex(ProtocolError, "without READY acquire/covers"):
++            sim.run({0: sender(), 1: receiver()})
++
++    def test_get_requires_source_publication(self):
++        sim, src, dst, _, _ = self.setup_pair()
++
++        def requester():
++            yield CopyAsync(src, dst)
++
++        with self.assertRaisesRegex(ProtocolError, "source lease"):
++            sim.run({1: requester()})
++
++    def test_get_source_lease_and_ack_before_destination_consumer_finishes(self):
++        sim, src, dst, ready, ack = self.setup_pair()
++        done = []
++
++        def owner():
++            yield Signal(ready, 1, (src,))
++            yield WaitSignal(ack, 1)
++            yield Write(src, array(2))
++            self.assertEqual(done, [])
++            yield Quiet()
++
++        def requester():
++            yield WaitSignal(ready, 1, (src,))
++            yield Delay(9)
++            event = yield CopyAsync(src, dst)
++            yield Wait(event)
++            yield Signal(ack, 1)
++
++            def consume(data):
++                done.append(True)
++                return (data,)
++
++            event = yield Compute("slow_local_consumer", (dst,), (BufferRef(1, "out"),), consume, ticks=50)
++            yield Wait(event)
++            yield Quiet()
++
++        sim.run({0: owner(), 1: requester()})
++        np.testing.assert_array_equal(sim.read_buffer(BufferRef(1, "out")), array(1))
++        np.testing.assert_array_equal(sim.read_buffer(src), array(2))
++
++    def test_get_source_cannot_be_reused_before_requester_starts(self):
++        sim, src, dst, ready, _ = self.setup_pair()
++
++        def owner():
++            yield Signal(ready, 1, (src,))
++            yield Delay(4)
++            yield Write(src, array(2))
++
++        def requester():
++            yield WaitSignal(ready, 1, (src,))
++            yield Delay(20)
++            yield CopyAsync(src, dst)
++
++        with self.assertRaisesRegex(ProtocolError, "before ACK acquire"):
++            sim.run({0: owner(), 1: requester()})
++
++    def test_get_remote_wait_is_rejected(self):
++        sim, src, dst, ready, ack = self.setup_pair()
++
++        def owner():
++            yield Signal(ready, 1, (src,))
++            yield WaitSignal(ack, 1)
++
++        def requester():
++            yield WaitSignal(ready, 1, (src,))
++            event = yield CopyAsync(src, dst)
++            yield Wait(event, "remote")
++
++        with self.assertRaisesRegex(ProtocolError, "get does not support remote"):
++            sim.run({0: owner(), 1: requester()})
++
++    def test_get_destination_not_readable_before_local_completion(self):
++        sim, src, dst, ready, ack = self.setup_pair(min_delay=5, max_delay=5)
++
++        def owner():
++            yield Signal(ready, 1, (src,))
++            yield WaitSignal(ack, 1)
++
++        def requester():
++            yield WaitSignal(ready, 1, (src,))
++            yield CopyAsync(src, dst)
++            yield Compute("early", (dst,), (), lambda data: ())
++
++        with self.assertRaisesRegex(ProtocolError, "before local completion"):
++            sim.run({0: owner(), 1: requester()})
++
++    def test_missing_acquire_covers_is_rejected(self):
++        sim, src, dst, ready, ack = self.setup_pair()
++
++        def sender():
++            yield PutSignal(src, dst, ready, 1)
++            yield WaitSignal(ack, 1)
++
++        def receiver():
++            yield WaitSignal(ready, 1)
++            yield Compute("missing_covers", (dst,), (), lambda data: ())
++
++        with self.assertRaisesRegex(ProtocolError, "without READY acquire/covers"):
++            sim.run({0: sender(), 1: receiver()})
++
++    def test_early_ready_fault_is_detected_for_every_seed(self):
++        for seed in range(20):
++            sim, src, dst, ready, ack = self.setup_pair(fault="early_ready", seed=seed)
++
++            def sender():
++                yield PutSignal(src, dst, ready, 1)
++                yield WaitSignal(ack, 1)
++
++            with self.subTest(seed=seed), self.assertRaisesRegex(ProtocolError, "READY arrived before payload"):
++                sim.run({0: sender(), 1: self.receiver(dst, ready, ack)})
++            self.assertTrue(sim.report()["fault_injected"])
++
++    def test_missing_ack_reuse_is_detected_even_with_delayed_consumer(self):
++        sim, src, dst, ready, ack = self.setup_pair()
++
++        def sender():
++            event = yield PutSignal(src, dst, ready, 1)
++            yield Wait(event, "remote")
++            yield Write(src, array(2))
++            yield PutSignal(src, dst, ready, 2)
++
++        with self.assertRaisesRegex(ProtocolError, "before ACK acquire"):
++            sim.run({0: sender(), 1: self.receiver(dst, ready, ack, delay=50)})
++        # The first actual payload remains intact: the second generation is
++        # stopped at its write boundary, not silently accepted as epoch one.
++        np.testing.assert_array_equal(sim.read_buffer(dst), array(1))
++
++    def test_ack_delivery_does_not_replace_ack_acquire(self):
++        sim, src, dst, ready, ack = self.setup_pair()
++
++        def sender():
++            yield PutSignal(src, dst, ready, 1)
++            yield Delay(40)
++            yield PutSignal(src, dst, ready, 2)
++
++        with self.assertRaisesRegex(ProtocolError, "before ACK acquire"):
++            sim.run({0: sender(), 1: self.receiver(dst, ready, ack)})
++
++    def test_covered_epoch_cannot_silently_skip_to_newer_payload(self):
++        sim, src, dst, ready, ack = self.setup_pair()
++
++        def sender():
++            yield Write(src, array(2))
++            yield PutSignal(src, dst, ready, 2)
++            yield WaitSignal(ack, 2)
++
++        # Real wrong-generation counterexample: >= 1 is true for READY(2),
++        # and the actual received values are 2, not the expected generation 1.
++        with self.assertRaisesRegex(ProtocolError, "wrong payload epoch"):
++            sim.run({0: sender(), 1: self.receiver(dst, ready, ack, value=1)})
++        np.testing.assert_array_equal(sim.read_buffer(dst), array(2))
++        self.assertFalse(np.array_equal(sim.read_buffer(dst), array(1)))
++
++    def test_release_waits_for_delayed_reader(self):
++        sim, _ = exchange(seed=8, rounds=1, slots=1, consumer_ticks=40)
++        for rank in range(2):
++            end = next(e["ts"] for e in sim.trace_events if e["name"] == "compute_end" and e["pid"] == rank)
++            ack = next(
++                e["ts"] for e in sim.trace_events if e["name"] == "signal_issue" and e["pid"] == rank and "ack" in e["args"]["destination"]
++            )
++            self.assertGreaterEqual(ack, end)
++
++    def test_missing_ack_release_region_is_detected(self):
++        sim, src, dst, ready, ack = self.setup_pair()
++
++        def sender():
++            yield PutSignal(src, dst, ready, 1)
++            yield WaitSignal(ack, 1)
++            yield Quiet()
++
++        def receiver():
++            yield WaitSignal(ready, 1, (dst,))
++            event = yield Compute("slow", (dst,), (), lambda data: (), ticks=20)
++            yield Signal(ack, 1)  # missing release_regions=(dst,)
++            yield Wait(event)
++            yield Quiet()
++
++        with self.assertRaisesRegex(ProtocolError, "without drain/ACK"):
++            sim.run({0: sender(), 1: receiver()})
++
++    def test_drop_ack_causes_conditional_deadlock(self):
++        sim, src, dst, ready, ack = self.setup_pair(fault="drop_ack")
++
++        def sender():
++            yield PutSignal(src, dst, ready, 1)
++            yield WaitSignal(ack, 1)
++            yield Quiet()
++
++        with self.assertRaises(DeadlockError):
++            sim.run({0: sender(), 1: self.receiver(dst, ready, ack)})
++        self.assertTrue(sim.report()["fault_injected"])
++        self.assertTrue(sim.report()["open_leases"])
++
++    def test_both_ranks_wait_before_publishing_deadlocks(self):
++        sim, _, _, ready, ack = self.setup_pair()
++
++        def first():
++            yield WaitSignal(ack, 1)
++
++        def second():
++            yield WaitSignal(ready, 1)
++
++        with self.assertRaises(DeadlockError):
++            sim.run({0: first(), 1: second()})
++        self.assertEqual(sim.report()["logical_ticks"], 1)
++
++    def test_exit_requires_event_drain(self):
++        sim, src, dst, _, _ = self.setup_pair(min_delay=5, max_delay=5)
++
++        def sender():
++            yield CopyAsync(src, dst)
++
++        with self.assertRaisesRegex(ProtocolError, "without drain/ACK"):
++            sim.run({0: sender()})
++        self.assertTrue(sim.report()["pending_events"])
++
++    def test_corrupt_payload_changes_only_transferred_data_and_passes_protocol(self):
++        sim, src, dst, ready, ack = self.setup_pair(fault="corrupt_payload")
++
++        def sender():
++            yield PutSignal(src, dst, ready, 1)
++            yield WaitSignal(ack, 1)
++            yield Quiet()
++
++        sim.run({0: sender(), 1: self.receiver(dst, ready, ack)})
++        self.assertTrue(sim.report()["passed"])
++        self.assertTrue(sim.report()["fault_injected"])
++        np.testing.assert_array_equal(sim.read_buffer(src), array(1))
++        self.assertNotEqual(sim.read_buffer(dst)[0, 0], sim.read_buffer(src)[0, 0])
++
++    def test_bf16_transport_preserves_raw_bits(self):
++        sim = Simulator()
++        src, dst = BufferRef(0, "a"), BufferRef(1, "a")
++        ready, ack = SignalRef(1, "ready"), SignalRef(0, "ack")
++        bits = np.array([0x3F80, 0x4000, 0xC000, 0x3F00], dtype="<u2")
++        sim.register_buffer(src, bits)
++        sim.register_buffer(dst, np.zeros_like(bits))
++        sim.register_signal(ready)
++        sim.register_signal(ack)
++
++        def sender():
++            yield PutSignal(src, dst, ready, 1)
++            yield WaitSignal(ack, 1)
++            yield Quiet()
++
++        def receiver():
++            yield WaitSignal(ready, 1, (dst,))
++            event = yield Compute("inspect", (dst,), (), lambda data: ())
++            yield Wait(event)
++            yield Signal(ack, 1, (dst,))
++            yield Quiet()
++
++        sim.run({0: sender(), 1: receiver()})
++        np.testing.assert_array_equal(sim.read_buffer(dst), bits)
++
++    def test_shape_dtype_and_signal_writer_validation(self):
++        sim, src, _, _, _ = self.setup_pair()
++
++        def bad_dtype():
++            yield Write(src, np.ones((2, 2), dtype=np.float64))
++
++        with self.assertRaisesRegex(ProtocolError, "shape/dtype mismatch"):
++            sim.run({0: bad_dtype()})
++        sim = Simulator()
++        ref = SignalRef(2, "shared")
++        sim.register_signal(ref)
++
++        def signal(value):
++            yield Signal(ref, value)
++            yield Quiet()
++
++        with self.assertRaisesRegex(ProtocolError, "multiple writers"):
++            sim.run({0: signal(1), 1: signal(2)})
++
++    def test_signal_epoch_must_increase(self):
++        sim = Simulator()
++        ref = SignalRef(1, "ready")
++        sim.register_signal(ref)
++
++        def sender():
++            yield Signal(ref, 1)
++            yield Signal(ref, 1)
++
++        with self.assertRaisesRegex(ProtocolError, "must increase"):
++            sim.run({0: sender()})
++
++    def test_self_target_signal_is_rejected(self):
++        sim = Simulator()
++        ref = SignalRef(0, "self")
++        sim.register_signal(ref)
++
++        def program():
++            yield Signal(ref, 1)
++
++        with self.assertRaisesRegex(ProtocolError, "remote rank"):
++            sim.run({0: program()})
++
++    def test_old_consumer_read_after_ack_acquire_is_rejected(self):
++        sim, src, dst, ready, ack = self.setup_pair()
++
++        def sender():
++            yield PutSignal(src, dst, ready, 1)
++            yield WaitSignal(ack, 1)
++            yield Quiet()
++
++        def receiver():
++            yield WaitSignal(ready, 1, (dst,))
++            yield Signal(ack, 1, (dst,))
++            yield Delay(20)
++            yield Compute("use_after_ack", (dst,), (), lambda data: ())
++
++        with self.assertRaisesRegex(ProtocolError, "read after ACK"):
++            sim.run({0: sender(), 1: receiver()})
++
++    def test_callback_cannot_modify_original_read_buffers(self):
++        sim = Simulator()
++        ref, out = BufferRef(0, "input"), BufferRef(0, "output")
++        sim.register_buffer(ref, array(1))
++        sim.register_buffer(out, array(0))
++
++        def callback(data):
++            data[:] = 7
++            return (data,)
++
++        def program():
++            event = yield Compute("copy", (ref,), (out,), callback)
++            yield Wait(event)
++
++        sim.run({0: program()})
++        np.testing.assert_array_equal(sim.read_buffer(ref), array(1))
++        np.testing.assert_array_equal(sim.read_buffer(out), array(7))
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_cosim_runtime.py b/tests/test_cosim_runtime.py
+new file mode 100644
+index 0000000..12faee5
+--- /dev/null
++++ b/tests/test_cosim_runtime.py
+@@ -0,0 +1,33 @@
++"""The companion stays independent of uncommitted MIX scheduler changes."""
++
++import unittest
++from unittest.mock import patch
++
++from cosim.runtime import prepare_mix_scheduler_fix, record_environment, validate_mix_scheduler_fix
++
++
++class RuntimeCompatibilityTests(unittest.TestCase):
++    def test_off_delegates_original_two_argument_runtime_api(self):
++        fix = prepare_mix_scheduler_fix("cann", "off", 1, {"AIC"})
++        self.assertFalse(fix["apply"])
++        self.assertFalse(fix["mixed"])
++        with patch("cosim.runtime._record_environment", return_value={"fixture": "value"}) as original:
++            self.assertEqual(record_environment("cann", "run", fix), {"fixture": "value"})
++        original.assert_called_once_with("cann", "run")
++        self.assertEqual(validate_mix_scheduler_fix(fix, "run", 1), {"passed": True, "status": "not_applied", "report": None})
++
++    def test_repair_modes_are_rejected(self):
++        for mode in ("auto", "required", "typo", None):
++            with self.subTest(mode=mode), self.assertRaisesRegex(ValueError, "only.*off"):
++                prepare_mix_scheduler_fix("cann", mode, 1, {"AIC"})
++
++    def test_cannot_claim_repair_validation(self):
++        for fix in ({"mode": "off", "apply": True}, {"mode": "auto", "apply": False}, {}, None):
++            with self.subTest(fix=fix), self.assertRaisesRegex(ValueError, "cannot apply or validate"):
++                validate_mix_scheduler_fix(fix, "run", 1)
++            with self.subTest(fix=fix), self.assertRaisesRegex(ValueError, "cannot apply or validate"):
++                record_environment("cann", "run", fix)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_cosim_segments.py b/tests/test_cosim_segments.py
+new file mode 100644
+index 0000000..2fc9b37
+--- /dev/null
++++ b/tests/test_cosim_segments.py
+@@ -0,0 +1,246 @@
++"""Exercise segment orchestration with real subprocesses and real trace/accuracy checks."""
++
++import contextlib
++import io
++import json
++import os
++from pathlib import Path
++import sys
++import tempfile
++import time
++import unittest
++from unittest.mock import patch
++
++import numpy as np
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++
++from cosim.segments import GemmSegmentExecutor, SegmentExecutionError
++from utils.io import sha256
++
++
++# This is a test Host, not a simulator replacement. It executes outside the test
++# process, produces the ordinary binary ABI, and writes minimal real callback
++# records for the production exporter to validate. CANN is not required here.
++FAKE_HOST = r"""
++import argparse
++import os
++from pathlib import Path
++import struct
++import subprocess
++import sys
++import time
++import numpy as np
++
++parser = argparse.ArgumentParser()
++for name in ("kernel", "kind", "seq-len", "blocks", "output", "data-dir"):
++    parser.add_argument("--" + name)
++args = parser.parse_args()
++print("test host entered", flush=True)
++arrays = []
++for name in ("a", "b"):
++    raw = np.fromfile(Path(args.data_dir) / (name + ".bin"), dtype="<u2").reshape(64, 64)
++    arrays.append((raw.astype(np.uint32) << 16).view(np.float32))
++result = arrays[0] @ arrays[1]
++if MODE == "wrong-output":
++    result[0, 0] += 1
++result.astype("<f4").tofile(args.output)
++header = struct.Struct("<QQIIIII")
++with open(os.environ["CANNSIM_DETAIL_LOG"], "wb") as stream:
++    stream.write(b"CANNTRC1")
++    for subcore in ([0] if MODE == "missing-end" else [0, 1]):
++        decode = b"(PC: 0x100) FLOWCTRL: (Binary: 0x0) (ID: 1) END"
++        detail = b"test callback detail"
++        for phase in (0, 1):
++            stream.write(header.pack(10 + phase, 0x100, 0, subcore, phase, len(decode), len(detail)))
++            stream.write(decode + detail)
++if MODE == "timeout":
++    # The child must also die: a later marker would expose incomplete group cleanup.
++    marker = str(Path(args.output).parent / "surviving_child")
++    child = "import pathlib,time; time.sleep(1.2); pathlib.Path(%r).write_text('alive')" % marker
++    subprocess.Popen([sys.executable, "-c", child])
++    print("child spawned", flush=True)
++    time.sleep(20)
++if MODE == "failed-exit":
++    sys.exit(7)
++"""
++
++
++class GemmSegmentExecutorTests(unittest.TestCase):
++    def setUp(self):
++        self.temporary = tempfile.TemporaryDirectory()
++        self.addCleanup(self.temporary.cleanup)
++        self.root = Path(self.temporary.name)
++        self.kernel = self.root / "test.o"
++        self.kernel.write_bytes(b"verified test fixture ABI")
++        self.source = self.root / "gemm_cannsim_runner"
++        self.mode = "success"
++        self.a = np.full((64, 64), 0x3F80, dtype="<u2")  # BF16 1.0
++        self.b = np.full((64, 64), 0x3F00, dtype="<u2")  # BF16 0.5
++        self.fix_template = {"mode": "off", "apply": False, "verification": {"status": "not_applied"}}
++        self.environment_calls = []
++        self.stack = contextlib.ExitStack()
++        self.addCleanup(self.stack.close)
++        self.build = self.stack.enter_context(patch("cosim.segments.build_runner", side_effect=self.build_host))
++        self.stack.enter_context(patch("cosim.segments.prepare_mix_scheduler_fix", return_value=self.fix_template))
++        self.stack.enter_context(patch("cosim.segments.record_environment", side_effect=self.environment))
++        self.stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
++
++    def build_host(self, cann_home, target):
++        self.source.write_text(f"#!{sys.executable}\nMODE = {self.mode!r}\n" + FAKE_HOST)
++        self.source.chmod(0o755)
++        return self.source
++
++    def environment(self, cann_home, run_dir, mix_fix):
++        # Emulate record_environment's per-launch mutation, preserving os.environ.
++        self.assertNotIn("loaded_library", mix_fix)
++        mix_fix["loaded_library"] = str(run_dir / "runner" / "test-library.so")
++        self.environment_calls.append(mix_fix)
++        result = dict(os.environ)
++        result["CANNSIM_DETAIL_LOG"] = str(run_dir / "instructions.bin")
++        return result
++
++    def executor(self, **kwargs):
++        return GemmSegmentExecutor(self.kernel, self.root / "run", self.root / "cann", **kwargs)
++
++    def test_separate_rank_inputs_and_recordings_build_once(self):
++        initial_environment = dict(os.environ)
++        executor = self.executor()
++        first = executor.execute(0, "local", self.a, self.b)
++        # A later build/ replacement must not alter the per-run Host snapshot.
++        self.source.write_text("this is no longer executable Python\n")
++        second = executor.execute(1, "remote", self.b, self.b)
++        np.testing.assert_array_equal(first, np.full((64, 64), 32, dtype=np.float32))
++        np.testing.assert_array_equal(second, np.full((64, 64), 16, dtype=np.float32))
++        self.assertEqual(self.build.call_count, 1)
++        self.assertEqual(os.environ, initial_environment)
++        self.assertEqual(len(executor.reports), 2)
++        reports = [json.loads(Path(item["manifest_path"]).read_text()) for item in executor.reports]
++        self.assertNotEqual(reports[0]["run_dir"], reports[1]["run_dir"])
++        self.assertNotEqual(reports[0]["input_sha256"]["a"], reports[1]["input_sha256"]["a"])
++        for report in reports:
++            self.assertTrue(report["passed"])
++            self.assertTrue(report["accuracy"]["passed"])
++            self.assertEqual(report["accuracy"]["elements"], 4096)
++            self.assertTrue(report["report_complete"])
++            self.assertTrue(report["mix_scheduler_fix"]["verification"]["passed"])
++            self.assertEqual(len(report["pipeline_traces"]), 2)
++            self.assertTrue(all(Path(path).is_file() for path in report["pipeline_traces"]))
++            self.assertEqual(report["runner_sha256"], sha256(report["runner"]))
++            self.assertEqual(report["input_sha256"]["a"], sha256(Path(report["data_dir"]) / "a.bin"))
++            self.assertEqual(report["record_command"].count("--blocks"), 1)
++        self.assertNotIn("loaded_library", self.fix_template)
++        self.assertNotIn("passed", self.fix_template["verification"])
++        self.assertIsNot(self.environment_calls[0], self.environment_calls[1])
++
++    def test_native_exit_failure_keeps_successful_accuracy_and_trace_but_fails_segment(self):
++        self.mode = "failed-exit"
++        executor = self.executor()
++        with self.assertRaises(SegmentExecutionError) as caught:
++            executor.execute(0, "failed", self.a, self.b)
++        report = caught.exception.manifest
++        self.assertEqual(report["record_returncode"], 7)
++        self.assertTrue(report["accuracy"]["passed"])
++        self.assertTrue(report["report_complete"])
++        self.assertFalse(report["passed"])
++        self.assertIn("test host entered", (Path(report["run_dir"]) / "record.log").read_text())
++        self.assertEqual(executor.reports[0], json.loads(caught.exception.manifest_path.read_text()))
++
++    def test_wrong_output_fails_but_still_exports_both_trace_views(self):
++        self.mode = "wrong-output"
++        with self.assertRaises(SegmentExecutionError) as caught:
++            self.executor().execute(1, "wrong", self.a, self.b)
++        report = caught.exception.manifest
++        self.assertEqual(report["record_returncode"], 0)
++        self.assertEqual(report["accuracy"]["mismatches"], 1)
++        self.assertEqual(report["accuracy"]["max_abs_error"], 1)
++        self.assertTrue(report["report_complete"])
++        self.assertEqual(len(report["pipeline_traces"]), 2)
++
++    def test_missing_vector_end_fails_even_when_accuracy_passes(self):
++        self.mode = "missing-end"
++        with self.assertRaises(SegmentExecutionError) as caught:
++            self.executor().execute(0, "missing_end", self.a, self.b)
++        report = caught.exception.manifest
++        self.assertTrue(report["accuracy"]["passed"])
++        self.assertFalse(report["report_complete"])
++        self.assertIn("missing END", report["report_error"])
++        self.assertEqual(len(report["pipeline_traces"]), 2)
++
++    def test_explicit_pure_cube_requires_only_aic_end(self):
++        self.mode = "missing-end"  # This fixture records an AIC-only kernel.
++        executor = self.executor(expected_cores=("AIC",))
++        executor.execute(0, "pure_cube", self.a, self.b)
++        report = executor.reports[0]
++        self.assertTrue(report["passed"])
++        self.assertEqual(report["expected_cores"], ["AIC"])
++        summary = json.loads(Path(report["pipeline_summary"]).read_text())[0]
++        self.assertEqual(summary["observed_cores"], ["AIC"])
++        self.assertEqual(summary["ended_cores"], ["AIC"])
++        self.assertTrue(summary["complete"])
++        self.assertEqual(len(report["pipeline_traces"]), 2)
++
++    def test_invalid_expected_cores_fail_before_build(self):
++        for cores in ([], ["AIV0"], ["AIC", "unknown"], "AIC"):
++            with self.subTest(cores=cores):
++                with self.assertRaisesRegex(ValueError, "expected_cores"):
++                    self.executor(expected_cores=cores)
++        self.assertEqual(self.build.call_count, 0)
++
++    def test_timeout_kills_child_group_and_preserves_partial_recording(self):
++        self.mode = "timeout"
++        started = time.monotonic()
++        with self.assertRaises(SegmentExecutionError) as caught:
++            self.executor(timeout_seconds=0.8).execute(0, "timeout", self.a, self.b)
++        report = caught.exception.manifest
++        self.assertLess(time.monotonic() - started, 5)
++        self.assertTrue(report["record_timed_out"])
++        self.assertEqual(report["record_returncode"], -9)
++        self.assertFalse(report["passed"])
++        self.assertTrue(report["accuracy"]["passed"])
++        self.assertTrue(report["report_complete"])
++        self.assertIn("child spawned", (Path(report["run_dir"]) / "record.log").read_text())
++        time.sleep(1.3)
++        self.assertFalse((Path(report["run_dir"]) / "surviving_child").exists())
++
++    def test_spawn_failure_is_recorded_and_attempts_accuracy_and_trace(self):
++        executor = self.executor()
++        with patch("cosim.segments.subprocess.Popen", side_effect=OSError("cannot launch fixture")):
++            with self.assertRaises(SegmentExecutionError) as caught:
++                executor.execute(0, "spawn", self.a, self.b)
++        report = caught.exception.manifest
++        self.assertIn("cannot launch fixture", report["errors"][0])
++        self.assertFalse(report["accuracy"]["passed"])
++        self.assertFalse(report["report_complete"])
++        self.assertTrue((Path(report["run_dir"]) / "report.log").is_file())
++
++    def test_missing_required_mix_evidence_fails_despite_correct_computation(self):
++        self.fix_template["apply"] = True
++        self.fix_template["verification"] = {"status": "pending"}
++        with self.assertRaises(SegmentExecutionError) as caught:
++            self.executor().execute(0, "no_mix_report", self.a, self.b)
++        report = caught.exception.manifest
++        self.assertTrue(report["accuracy"]["passed"])
++        self.assertTrue(report["report_complete"])
++        self.assertFalse(report["mix_scheduler_fix"]["verification"]["passed"])
++        self.assertFalse(report["passed"])
++
++    def test_changed_kernel_is_rejected_before_launch_and_reported(self):
++        executor = self.executor()
++        self.kernel.write_bytes(b"a different ABI")
++        with self.assertRaises(SegmentExecutionError) as caught:
++            executor.execute(0, "changed", self.a, self.b)
++        self.assertIn("kernel object changed", caught.exception.manifest["errors"][0])
++        self.assertEqual(self.environment_calls, [])
++
++    def test_rejects_float_arrays_and_invalid_limits(self):
++        executor = self.executor()
++        with self.assertRaisesRegex(ValueError, "raw little-endian BF16"):
++            executor.execute(0, "float", self.a.astype(np.float32), self.b)
++        for timeout in (0, -1, float("inf"), float("nan")):
++            with self.assertRaisesRegex(ValueError, "timeout"):
++                self.executor(timeout_seconds=timeout)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_cosim_worker.py b/tests/test_cosim_worker.py
+new file mode 100644
+index 0000000..5cd0e1a
+--- /dev/null
++++ b/tests/test_cosim_worker.py
+@@ -0,0 +1,195 @@
++"""The JSON bridge must isolate native stdout and reject malformed requests."""
++
++import json
++import os
++from pathlib import Path
++import signal
++import subprocess
++import sys
++import tempfile
++import time
++import unittest
++
++import numpy as np
++
++ROOT = Path(__file__).resolve().parents[1]
++
++# Exercise the actual CLI worker and OS file descriptors in a fresh process.
++# The fixture emits native stdout during build and execution to reproduce the
++# contamination that contextlib.redirect_stdout alone cannot prevent.
++WORKER_FIXTURE = r"""
++import os
++import subprocess
++import sys
++from cosim import worker
++
++class Executor:
++    def __init__(self, *args, **kwargs):
++        print("python build diagnostic", flush=True)
++        subprocess.run([sys.executable, "-c", "import os; os.write(1, b'native build diagnostic\\n')"], check=True)
++        if os.environ.get("WORKER_TEST_STARTUP_FAIL"):
++            raise RuntimeError("fixture initialization failed")
++        self.reports = []
++    def execute(self, rank, segment_id, a, b):
++        os.write(1, b"native execute diagnostic\n")
++        self.reports.append({"passed": True, "rank": rank, "segment_id": segment_id,
++                             "first_a": int(a[0, 0]), "first_b": int(b[0, 0])})
++worker.prepare_environment = lambda: "/unused-fixture-cann"
++worker.GemmSegmentExecutor = Executor
++raise SystemExit(worker.main())
++"""
++
++
++CANCELLABLE_WORKER_FIXTURE = r"""
++import os
++from pathlib import Path
++from cosim import worker
++from cosim import segments
++segments.build_runner = lambda *args: Path(os.environ["WORKER_TEST_HOST"])
++segments.prepare_mix_scheduler_fix = lambda *args: {"mode":"off", "apply":False}
++segments.record_environment = lambda *args: dict(os.environ)
++worker.prepare_environment = lambda: "/unused-fixture-cann"
++raise SystemExit(worker.main())
++"""
++
++CANCELLABLE_HOST = r"""
++import argparse, json, os, subprocess, sys, time
++from pathlib import Path
++parser = argparse.ArgumentParser()
++for name in ("kernel", "kind", "seq-len", "blocks", "output", "data-dir"):
++    parser.add_argument("--" + name)
++args = parser.parse_args()
++directory = Path(args.output).parent
++marker = str(directory / "orphan_survived")
++child = subprocess.Popen([sys.executable, "-c", "import pathlib,time; time.sleep(1.2); pathlib.Path(%r).write_text('alive')" % marker])
++(directory / "spawned.json").write_text(json.dumps({"runner":os.getpid(), "child":child.pid}))
++time.sleep(30)
++"""
++
++
++class WorkerTests(unittest.TestCase):
++    def setUp(self):
++        self.temporary = tempfile.TemporaryDirectory()
++        self.addCleanup(self.temporary.cleanup)
++        self.directory = Path(self.temporary.name)
++        for name, value in (("a", 0x3F80), ("b", 0x3F00)):
++            np.full((64, 64), value, dtype="<u2").tofile(self.directory / f"{name}.bin")
++
++    def run_worker(self, requests, *, fail_startup=False):
++        environment = dict(os.environ)
++        if fail_startup:
++            environment["WORKER_TEST_STARTUP_FAIL"] = "1"
++        process = subprocess.run(
++            [
++                sys.executable,
++                "-c",
++                WORKER_FIXTURE,
++                "--kernel",
++                str(self.directory / "test.aibin"),
++                "--run-dir",
++                str(self.directory),
++                "--expected-cores",
++                "AIC",
++            ],
++            input="".join(json.dumps(request) + "\n" for request in requests),
++            cwd=ROOT,
++            env=environment,
++            capture_output=True,
++            text=True,
++            timeout=10,
++        )
++        return process, [json.loads(line) for line in process.stdout.splitlines()]
++
++    def test_native_and_python_diagnostics_do_not_contaminate_json_wire(self):
++        request = dict(op="execute", rank=1, segment_id="received", a=str(self.directory / "a.bin"), b=str(self.directory / "b.bin"))
++        process, responses = self.run_worker([request, {"op": "close"}])
++        self.assertEqual(process.returncode, 0, process.stderr)
++        self.assertEqual(len(responses), 2)
++        self.assertEqual(responses[0], {"ready": True})
++        self.assertTrue(responses[1]["passed"])
++        self.assertEqual(responses[1]["manifest"]["first_a"], 0x3F80)
++        self.assertEqual(responses[1]["manifest"]["first_b"], 0x3F00)
++        for diagnostic in ("python build diagnostic", "native build diagnostic", "native execute diagnostic"):
++            self.assertIn(diagnostic, process.stderr)
++            self.assertNotIn(diagnostic, process.stdout)
++
++    def test_request_errors_are_json_failures_and_worker_remains_usable(self):
++        process, responses = self.run_worker([[], {"op": "unknown"}, {"op": "close"}])
++        self.assertEqual(process.returncode, 0)
++        self.assertTrue(responses[0]["ready"])
++        self.assertFalse(responses[1]["passed"])
++        self.assertIn("JSON object", responses[1]["error"])
++        self.assertFalse(responses[2]["passed"])
++        self.assertIn("execute or close", responses[2]["error"])
++
++    def test_sigterm_worker_kills_active_native_group_and_records_failure(self):
++        kernel = self.directory / "test.aibin"
++        kernel.write_bytes(b"fixture ABI")
++        host = self.directory / "gemm_cannsim_runner"
++        host.write_text(f"#!{sys.executable}\n" + CANCELLABLE_HOST)
++        host.chmod(0o755)
++        environment = dict(os.environ, WORKER_TEST_HOST=str(host))
++        process = subprocess.Popen(
++            [
++                sys.executable,
++                "-c",
++                CANCELLABLE_WORKER_FIXTURE,
++                "--kernel",
++                str(kernel),
++                "--run-dir",
++                str(self.directory / "run"),
++                "--expected-cores",
++                "AIC",
++                "--timeout",
++                "20",
++            ],
++            cwd=ROOT,
++            env=environment,
++            stdin=subprocess.PIPE,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.PIPE,
++            text=True,
++            start_new_session=True,
++        )
++        spawned = []
++        try:
++            self.assertEqual(json.loads(process.stdout.readline()), {"ready": True})
++            request = dict(op="execute", rank=0, segment_id="cancel", a=str(self.directory / "a.bin"), b=str(self.directory / "b.bin"))
++            process.stdin.write(json.dumps(request) + "\n")
++            process.stdin.flush()
++            deadline = time.monotonic() + 5
++            while not spawned and time.monotonic() < deadline:
++                spawned = list(self.directory.glob("run/segments/*/spawned.json"))
++                time.sleep(0.02)
++            self.assertEqual(len(spawned), 1, "fixture Host did not start")
++            process.terminate()
++            self.assertEqual(process.wait(timeout=5), 128 + signal.SIGTERM)
++            report = json.loads((spawned[0].parent / "manifest.json").read_text())
++            self.assertFalse(report["passed"])
++            self.assertTrue(report["record_interrupted"])
++            self.assertEqual(report["record_returncode"], -signal.SIGKILL)
++            self.assertIn("SystemExit", report["errors"][0])
++            time.sleep(1.3)
++            self.assertFalse((spawned[0].parent / "orphan_survived").exists())
++        finally:
++            if process.poll() is None:
++                process.kill()
++                process.wait(timeout=5)
++            for path in spawned:
++                try:
++                    os.killpg(json.loads(path.read_text())["runner"], signal.SIGKILL)
++                except ProcessLookupError:
++                    pass
++            for stream in (process.stdin, process.stdout, process.stderr):
++                stream.close()
++
++    def test_initialization_failure_returns_one_json_response_and_nonzero_exit(self):
++        process, responses = self.run_worker([], fail_startup=True)
++        self.assertEqual(process.returncode, 1)
++        self.assertEqual(len(responses), 1)
++        self.assertFalse(responses[0]["ready"])
++        self.assertIn("fixture initialization failed", responses[0]["error"])
++
++
++if __name__ == "__main__":
++    unittest.main()
