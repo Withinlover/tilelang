@@ -2,11 +2,11 @@
 
 设计日期：2026 年 10 月 23 日
 
-从新克隆部署和测试见[分布式 P0 测试指南](../testing/distributed_p0.md)。文中的本地产物路径仅标识历史验收记录，日志、输入和流水不随 Git 分发。
+本机联仿的部署和测试见[分布式 P0 测试指南](../testing/distributed_p0.md)；新增原生路径的部署、构建与真实双卡启动见[原生双卡测试指南](../testing/distributed_native.md)。文中的本地产物路径仅标识历史验收记录，日志、输入和流水不随 Git 分发。
 
-状态：已实现并验证 **P0 DSL 的本机功能路径**；原生双卡 transport、P0-A 设备通信合法化及 P0-B 调度仍是设计目标。当前可执行 profile 为 `ascend950_cannsim_v1`，详见第 14 节及[实现与验证记录](distributed_p0_implementation_validation.md)。
+状态：已实现并验证 **P0 DSL 的本机联仿路径**，并新增 **SHMEM 原生分段路径**。`ascend950_cannsim_v1` 执行 CPU 通信模型及可选 CANN 片段；`ascend950_shmem_mte_phased_v1` 将同一 TD 程序降为真实通信与计算子 kernel。原生分段路径已完成本机源码、SDK 编译和 Host ABI 检查，真实双卡正确性与可见性尚待用户实机验收。原设计的单 kernel P0-A 与 P0-B 调度仍是后续目标，详见第 14 节及[实现与验证记录](distributed_p0_implementation_validation.md)。
 
-原生执行设计目标：当前仓库的 Ascend 950 / AscendC 后端，复用 `tvm_ffi` 执行路径。当前本机执行由 CPU 协调通信语义、由 cannsim-helper 加载独立编译的单卡计算片段；不等于完整分布式函数已经通过 `tvm_ffi` 执行。
+原生执行目标：当前仓库的 Ascend 950 / AscendC 后端，复用 `tvm_ffi`。新增原生分段路径由 Host 提交独立的 SHMEM AIV 通信 kernel 和 TileLang Cube 计算 kernel，不通过 CPU 模型传输数据；完整分布式函数尚未融合成单个设备 kernel。以下单 kernel P0-A/P0-B 章节继续保留为目标规范。
 
 初始调研源码基线：`a2679e5c6d7523e63d6611f2012177a3a112df1f`。后续实现为当前工作区中的新增代码；下文的完整原生实现路线仍保留为目标规范。
 
@@ -33,7 +33,7 @@
 
 ### 2.1 当前仓库能复用什么
 
-以下是对当前源码的判断，链接相对本文位置：
+以下是初始调研基线的架构判断，链接相对本文位置；新增原生分段实现见第 14.2 节：
 
 | 现有机制 | 证据 | 对设计的约束 |
 | --- | --- | --- |
@@ -44,7 +44,7 @@
 | 参数在 backend lowering 之前提取 | [engine/lower.py](../../tilelang/engine/lower.py) | descriptor 参数须提前物化，不能在最后的 Ascend pass 中临时加参 |
 | callable wrapper 和已有 NPU launch ABI | [jit/kernel.py](../../tilelang/jit/kernel.py)、[ascend_module.cc](../../src/ascend/runtime/ascend_module.cc) | 复用已有 Build/Load/Launch，在外围增加会话绑定 |
 
-对当前 `tilelang/`、`src/` 和 Ascend 示例/测试的定向检查，没有发现附件所述 SHMEM/HCOMM 多 rank 集成。社区代码的存在不能算作当前仓库已经具备该能力。
+初始调研基线中没有发现附件所述 SHMEM/HCOMM 多 rank 集成；社区代码的存在不代表该基线具备这些能力。后续新增的 SHMEM 原生路径、固定依赖版本与验证范围单独记录于第 14.2 节。
 
 ### 2.2 外部实现的可借鉴范围
 
@@ -58,7 +58,7 @@
 
 950 也不能按同名函数直接替换：官方 [Ain WaitSignal 文档，固定提交 8869a611](https://gitcode.com/cann/asc-comm/blob/8869a611b0e9dac6ed68821a1eb75ed0d0d61d38/docs/zh/api/aicore/ain/WaitSignal.md) 的接口使用 uint64，提供 RELAX 顺序，不保证普通数据访问内存序。它不能直接承担本文的 acquire 契约。
 
-### 2.3 P0 的两个交付门槛
+### 2.3 原设计中单 kernel P0 的两个交付门槛
 
 | 项目 | P0-A：顺序正确性切片 | P0-B：完整 P0 |
 | --- | --- | --- |
@@ -71,6 +71,8 @@
 | 验收算子 | 双卡 put/get、带本地向量计算的交换 | 增加手写 tile 协议的 AllGather + GEMM |
 | 性能承诺 | 不承诺实际异步重叠 | 允许合法重叠，收益以端到端测量为准 |
 
+当前原生分段 profile 是两类单 kernel 交付之前的明确实现切片；它保留源 TD 协议并复用真实通信/计算 kernel，不将分段执行记作上表的单 kernel 融合验收。
+
 P0 不包括：设备端建组、任意 stride/gather、远端 UB/L1/L0、remote→remote、通用远端 atomic、设备 team barrier、多 channel/多发起核、任意超发 grid、通信服务端卸载、graph replay、并发共享会话、自动 mesh/collective 算法选择。它们不是错误的语言目标，而是本版未支持的能力。
 
 ## 3. 统一对象模型
@@ -79,8 +81,8 @@ P0 不包括：设备端建组、任意 stride/gather、远端 UB/L1/L0、remote
 
 ```python
 import tilelang.ascend.language as T
-import tilelang.language.distributed as TD  # 已实现源 DSL；原生设备 lowering 尚未启用
-import tilelang.distributed as D  # 已实现本机 profile 的 Host API
+import tilelang.language.distributed as TD  # 已实现源 DSL；执行模型由显式 profile 选择
+import tilelang.distributed as D  # 已实现 CPU 与显式原生分段 profile 的 Host API
 
 G = TD.GroupSpec("world", size=P)
 CH = TD.ChannelSpec("comm", group=G)
@@ -122,7 +124,7 @@ peer 必须属于绑定的组和通道，且不是本 rank；自拷贝使用本�
 
 ## 4. P0 API 规范
 
-下列签名是 P0 接口规范；已实现的同名源 API 可进入本机 profile。`Region` 表示本地 BufferRegion；`SignalRef` 是本地信号引用；`RemoteSignalRef` 是远端信号引用。`release_regions` 和 `covers` 统一接受 tuple/list，空列表有明确含义。原生 transport 的完成、可见性和资源落实仍须第 8 节的认证。
+下列签名是 P0 接口规范；已实现的同名源 API 可进入本机 profile 或其支持范围内的原生分段 profile。`Region` 表示本地 BufferRegion；`SignalRef` 是本地信号引用；`RemoteSignalRef` 是远端信号引用。`release_regions` 和 `covers` 统一接受 tuple/list，空列表有明确含义。原生 transport 的完成、可见性和资源落实仍须第 8 节的认证。
 
 ```text
 TD.rank(group: GroupSpec) -> int32
@@ -208,7 +210,7 @@ P0 可以把 fence 实现为 quiet，但程序不得依赖这个更强实现。�
 
 设备 DSL 成立的前提是 Host 层承担以下工作。此处同样是新增 API，不表示已有 `torch.distributed.ProcessGroup` 可直接作为设备参数。
 
-**以下示例是尚未启用的原生执行方案。** 当前 `D.init` 只接受 `process_group=None, device=None, profile="ascend950_cannsim_v1", world_size=2`，由一个 CPU 协调器持有全部 rank；当前可运行的 `D.compile`/`D.launch` 示例见[实现记录](distributed_p0_implementation_validation.md)。`ascend950_mapped_mte_v1`、真实 process group 和 device 绑定会明确报 unsupported。
+**以下示例保留单 kernel 原生执行的目标接口，不是新增分段 profile 的启动代码。** CPU profile `ascend950_cannsim_v1` 仍由一个协调器持有全部逻辑 rank；原生分段 profile `ascend950_shmem_mte_phased_v1` 使用每 rank 独立进程、真实 device 和 Session-owned stream，采用自己的 bootstrap/元信息通道，不接收外部 process group。其实际 API、依赖与命令见[原生双卡测试指南](../testing/distributed_native.md)。原目标名称 `ascend950_mapped_mte_v1` 仍未启用。
 
 ```python
 ctx = D.init(
@@ -271,6 +273,8 @@ preflight 通过只证明参数和资源契约一致，不证明任意设备控�
 即使分配了不同 epoch，同时共享 Recv 的两个 launch 仍会发生 payload 竞争。因此 P0 明确禁止同一 Session 并发 launch 和 graph capture/replay。将来若支持并发，需要一起隔离 payload、信号、descriptor、scratch、请求状态和 stream 生命周期。
 
 ### 5.3 ABI 设计
+
+本节描述单 kernel 目标 ABI。当前前端的 `cpu-model-v1` descriptor 只供 CPU profile 使用，不能上传给原生 transport；新增分段 profile 使用独立的 `host-phases-shmem-v1` 执行 manifest，实际 SHMEM 状态由 Host bridge 初始化，各子 kernel 只接收自己的普通 Buffer/标量参数。
 
 前端规范化产生普通 GM 参数、epoch 标量和一个内部 `uint8[descriptor_nbytes]` GM Buffer 参数，同时产生 `CommABIManifest`。该 descriptor 通过普通 Buffer/data 传参路径获取设备地址；不把 tensor 直接传给裸 `T.handle`，因为当前 packed API 对这种 handle 可以传递 `DLTensor*` 而不是 data 地址，参见 [make_packed_api.cc](../../src/transform/make_packed_api.cc)。用户不接触内部参数，由 D 绑定层填充。
 
@@ -535,7 +539,7 @@ for this peer path; select a certified transport or an explicit Host phase bound
 
 ### 8.1 首选数据路径与独立证据
 
-首选候选 profile 为 `ascend950_mapped_mte_v1`：Host 建立合法 peer GM 映射，唯一 AIV 通过 MTE 搬运，内部允许使用编译器规划的 UB scratch。DSL 首版仍只暴露 GM 端点，不阻止实现内部利用 UB。
+初始单 kernel 设计的首选候选 profile 为 `ascend950_mapped_mte_v1`，该名称仍未启用：Host 建立合法 peer GM 映射，唯一 AIV 通过 MTE 搬运，内部允许使用编译器规划的 UB scratch。DSL 首版仍只暴露 GM 端点，不阻止实现内部利用 UB。
 
 这条路径有 950 的直接证据。官方 `cann/asc-comm` 固定提交 `8869a611b0e9dac6ed68821a1eb75ed0d0d61d38` 的 [UB_MEM 样例说明](https://gitcode.com/cann/asc-comm/blob/8869a611b0e9dac6ed68821a1eb75ed0d0d61d38/examples/aicore/hcomm/03_one_multi_path/README.md) 给出 950PR/DT、CANN ≥ 9.1.0 和存在 `COMM_PROTOCOL_UB_MEM` peer 链路等条件；[Host 代码](https://gitcode.com/cann/asc-comm/blob/8869a611b0e9dac6ed68821a1eb75ed0d0d61d38/examples/aicore/hcomm/03_one_multi_path/main.cpp) 建立资源并获取远端地址；[设备代码](https://gitcode.com/cann/asc-comm/blob/8869a611b0e9dac6ed68821a1eb75ed0d0d61d38/examples/aicore/hcomm/03_one_multi_path/ubmem_data_copy.asc) 用单 AIV block 执行远端 GM→本地 UB→本地 GM，并显式同步 MTE2/MTE3。
 
@@ -593,7 +597,7 @@ UDMA、HCOMM 队列和服务端卸载可在以后实现同一语义，但需新�
 
 ### 9.1 文件地图
 
-下表保留完整原生实现的设计落点，不能作为当前模块的已完成清单。当前实际落点和剩余工作见第 14 节；本机执行没有新增 SHMEM helper 或原生通信调度 pass。
+下表保留完整单 kernel 原生实现的设计落点，不能作为当前模块的已完成清单。当前实际落点和剩余工作见第 14 节；新增分段路径在独立 kernel 中调用固定版本 SHMEM，并未实现表中的单 kernel 通信调度 pass。
 
 | 责任 | 拟新增/需修改的落点 |
 | --- | --- |
@@ -710,11 +714,15 @@ API 和协议边界已在本文给出；以下是平台实证问题，不能靠�
 通信污染负例成功触发独立全局精度失败。详见 实现与验证报告（`$CANNSIM_ROOT/docs/rank-cosimulation-validation-20261023.md`）。
 该工具扩展阶段的模型独立于本设计的 DSL/IR，只构成可复用验证基础。随后已完成以下源 DSL 接入，使协议和本地计算共同来自同一个 PrimFunc。
 
-## 14. 当前本机实现状态（2026-10-23）
+## 14. 已实现路径与验证状态（2026-10-23）
+
+### 14.1 本机联仿 profile 与首次交付记录
 
 已实现 `TD` 源 API、registered TIR op、eager 参数规范化、共享语义检查、CPU Session/epoch 绑定及 Ascend 950 计算片段联仿。双 rank AllGather + GEMM 的协议由 **同一个 canonical PrimFunc** 生成，不再调用工具中另写的 GEMM 协议生成器。本地 GEMM 从该函数实际的 copy/GEMM 语句提取，经当前仓库 Ascend lowering/codegen 和 Bisheng 重新编译，再由 cannsim-helper 执行。
 
-| 设计项 | 当前完成情况 | 尚未完成或有意限制 |
+以下表格限定于 `ascend950_cannsim_v1` 的首次交付；原生分段路径见下一节。
+
+| 设计项 | 本机 profile 完成情况 | 该 profile 未提供或有意限制 |
 | --- | --- | --- |
 | TD 类型和操作 | `GroupSpec`、`ChannelSpec`、`SymBuffer`、`SignalBuffer`、remote、put/get、event wait、signal/acquire、put_signal、fence/quiet | 仅 eager frontend；两个 rank、一个组和通道；无事件数组或跨迭代携带 |
 | TIR 与 ABI | `src/op/distributed.cc` 注册 opaque op；eager builder 在函数产出前追加 `uint8` descriptor 参数与稳定 JSON manifest | 当前 descriptor 是无设备地址的 CPU 模型 ABI；尚无真实 peer 地址表、设备句柄或通信 SDK ABI 绑定 |
@@ -727,4 +735,23 @@ API 和协议边界已在本文给出；以下是平台实证问题，不能靠�
 
 当前正例为 3 轮、2 slot、12 个 CANN GEMM 片段，49,152 个输出零错，最大绝对误差 `2.2887252271175385e-7`；24 个片段流水文件完成并通过独立审计。通信污染负例为 1 轮、4 个 CANN 片段：局部计算全部通过，独立全局 oracle 在 16,384 个元素中检出 64 个错误，顶层结果按预期失败。完整证据、可复现命令和已执行测试见[实现与验证记录](distributed_p0_implementation_validation.md)。
 
-因此，本次完成的是 **P0 DSL 到本地协议和真实单卡计算片段的功能验证闭环**。第 2.3、8、9.2、10.2–10.3 节的原生双卡 P0-A/P0-B 和性能门槛没有被该结果满足；它们继续保持未认证状态，也不要求用户提供保密真机环境来完成当前本机任务。
+该阶段完成了 **P0 DSL 到本地协议和真实单卡计算片段的功能验证闭环**。第 2.3、8、9.2、10.2–10.3 节的单 kernel 原生 P0-A/P0-B 和性能门槛没有被这些联仿结果满足。
+
+### 14.2 原生分段 profile：实现完成，真实双卡待验收
+
+新增 `ascend950_shmem_mte_phased_v1` 从同一个 canonical TD PrimFunc 生成两 rank 的有限顺序计划。通信操作降为固定版本 SHMEM 的 pure AIV micro-kernel，本地 GM copy 和从原语句提取的 pure Cube GEMM 分别执行；所有子 kernel 复用既有 Ascend 编译器和 `tvm_ffi`。每 rank 独立进程绑定一张 950，数据传输由设备 MTE 完成，CPU 控制面只交换初始化和一致性元信息。
+
+| 层次 | 已实现内容 | 验证边界 |
+| --- | --- | --- |
+| 共享计划 | [plan.py](../../tilelang/ascend/distributed/plan.py) 同时供联仿和原生路径使用，保留源通信操作、regions、serial/条件与实际计算语句 | 只接受 Host 标量/rank 可确定的结构化控制流；不证明一般跨 rank 协议安全 |
+| 编译与编排 | [native.py](../../tilelang/ascend/distributed/native.py) 预检所有 rank、epoch、区域和有限计划中的确定等待死锁，提取普通计算 PrimFunc | 普通 native gate 保留；源 descriptor 不传设备；无单 kernel 融合 |
+| 通信子 kernel | [transport.py](../../tilelang/ascend/distributed/transport.py) 提供 MTE put/get、原子 SET、设备 wait 与独立 scratch | 固定 `dav-3510`；连续 32 字节对齐区域；每个通信 kernel 在自身退出前 drain，不跨 kernel 依赖物理 AIV 或 pipe 状态 |
+| Host 与资源 | [native_runtime.py](../../tilelang/ascend/distributed/native_runtime.py) 及 [C++ bridge](../../src/ascend/distributed/shmem_host_bridge.cc) 建立 SHMEM、对称内存、peer 映射、DLPack 视图、独立 stream、集体预检与关闭 | 固定 SHMEM ABI；一个 Session/channel/active launch；失败保活，不把超时当作设备取消 |
+| 缓存与版本 | SHMEM 头文件内容进入编译 manifest/缓存；Host bridge 和库内容参与运行时一致性检查；具体 epoch/地址不进入可复用计算代码 | 修改依赖后重建，不能复用未经匹配的旧库或旧映射 |
+| 用例 | [原生入口](../../examples/distributed/run_native_distributed.py) 提供 put、get、同源 AllGather GEMM、slot 复用、多 launch 与源污染负例 | 全局 oracle 只使用原始输入；真实双卡结果尚待用户执行 |
+
+分段执行采用规范允许的更强完成：copy kernel 在返回前完成本次传输，put_signal 在同一 kernel 内完成 payload 后才发布并完成信号。后续 event wait、fence、quiet 不再承担另一 kernel 的未完成 pipe 工作。每 rank 的同一 stream 保持通信、计算和 ACK 的顺序；尾部 ACK 以及全组关闭协议仍保留。该执行模型明确限定读取路径，不把 SHMEM 的信号观察推广为任意 scalar/SIMT 缓存路径的 acquire。
+
+本机已经生成并实际编译同源 GEMM 的全部通信/计算子 kernel，经既有 `tvm_ffi` 导出包含设备代码的共享库；固定 SHMEM 库和使用真实 SDK 头文件的 Host bridge 也已构建。无设备测试覆盖计划、ABI、生命周期、错误诊断和独立结果验收；新增原生 put/get 的同一源 IR 还通过 CPU 协议模型验证 slot 复用、连续 launch、原始 peer 数据以及 lease/event 收尾。这些结果不包括真实 NPU 启动或跨卡内存可见性证明。
+
+依赖固定版本、编译与实机命令、输出字段和压力矩阵统一维护在[原生双卡测试指南](../testing/distributed_native.md)。原设计的单 kernel P0-A、P0-B 的 AutoSchedule/InsertSync/MultiBuffer 通信依赖与融合性能仍需后续实现和实机证据；本分段 profile 不改变这些交付门槛。

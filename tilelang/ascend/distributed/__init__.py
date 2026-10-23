@@ -1,1 +1,1 @@
-"""Ascend-owned distributed capability checks and local co-simulation lowering."""
+"""Ascend distributed planning, local co-simulation and native SHMEM phases."""

@@ -24,6 +24,7 @@ dist*/
 !tilelang/distributed/
 !tilelang/language/distributed/
 !tilelang/ascend/distributed/
+!src/ascend/distributed/
 !testing/ascend/distributed/
 !examples/distributed/
 wheelhouse/

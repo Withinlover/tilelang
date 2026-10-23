@@ -1,7 +1,8 @@
 """P0 distributed source DSL with explicit regions and completion semantics.
 
-The initial executable profile is local CANN co-simulation. These operations
-describe a protocol; they do not claim an available hardware transport.
+These operations describe a protocol. ``tilelang.distributed.compile`` selects
+either local co-simulation or the explicit Ascend 950 SHMEM phased profile;
+ordinary native compilation of the unlowered protocol remains unsupported.
 """
 
 from __future__ import annotations

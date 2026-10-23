@@ -90,6 +90,33 @@ def test_compatibility_profile_rejects_unrecognized_source():
         adapt_cann91_gemm64("extern int unrelated();")
 
 
+def test_sdk_compatibility_is_explicit_and_part_of_binary_cache(monkeypatch, tmp_path):
+    from tilelang.ascend.backend import tilelang_callback_ascend_compile
+    from tilelang.cache.ascend_binary_cache import AscendBinaryCache
+    from tilelang.contrib import bisheng
+    from tilelang.env import env
+    from tilelang.transform import PassConfigKey
+    from tvm.target import Target
+
+    source = tilelang.lower(_extract(_fixture()), target={"kind": "ascend", "arch": "dav-3510"}).kernel_source
+    calls = []
+    monkeypatch.setattr(env, "TILELANG_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(env, "TILELANG_DISABLE_CACHE", "0")
+    monkeypatch.setattr(env, "TILELANG_KERNEL_CACHE_USE_LIB_STAMP", "0")
+    monkeypatch.setattr(bisheng, "compile_ascend", lambda code, **kwargs: calls.append(code) or bytearray(b"compiled"))
+    monkeypatch.setattr(AscendBinaryCache, "_get_tilelang_lib_stamp", lambda: None)
+    target = Target({"kind": "ascend", "arch": "dav-3510"})
+    config = {PassConfigKey.TL_ASCEND_SDK_COMPATIBILITY: "cann-9.1-gemm64"}
+    tilelang_callback_ascend_compile(source, target)
+    tilelang_callback_ascend_compile(source, target, config)
+    tilelang_callback_ascend_compile(source, target, config)
+    assert calls == [source, adapt_cann91_gemm64(source)]
+    with pytest.raises(ValueError, match="Unknown Ascend SDK compatibility"):
+        tilelang_callback_ascend_compile(source, target, {PassConfigKey.TL_ASCEND_SDK_COMPATIBILITY: "unknown"})
+    with pytest.raises(ValueError, match="requires dav-3510"):
+        tilelang_callback_ascend_compile(source, Target({"kind": "ascend", "arch": "dav-2201"}), config)
+
+
 def _replace_call(fixture, index, *, args=None, annotations=None):
     statements, allocations, regions, block_annotations = fixture
     original = statements[index].value

@@ -20,6 +20,12 @@ def tilelang_callback_ascend_compile(code, target, pass_config=None):
 
     target_arch = bisheng.get_target_npu_arch(target)
 
+    compatibility = str(cfg.get(PassConfigKey.TL_ASCEND_SDK_COMPATIBILITY, "native"))
+    if compatibility != "native":
+        from .sdk_compat import adapt_source
+
+        code = adapt_source(code, compatibility, target_arch)
+
     compile_options = bisheng.get_bisheng_compile_options(target_arch, options)
     linker_options = bisheng.get_aibin_linker_options()
 

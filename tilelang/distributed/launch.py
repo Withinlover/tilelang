@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .abi import encode_descriptor, kernel_manifest, manifest_digest
+from .abi import NATIVE_PROFILE, encode_descriptor, kernel_manifest, manifest_digest
 from .session import LaunchTicket, Session, SymmetricBuffer, UnsupportedProfileError, _check_ticket, _validate_manifest
 
 
@@ -23,12 +23,16 @@ class RunFailedError(RuntimeError):
     """A local adapter returned a failed report; ``run`` retains its evidence."""
 
     def __init__(self, run):
-        super().__init__("distributed co-simulation failed; inspect the adapter report")
+        super().__init__("distributed execution failed; inspect the adapter report")
         self.run = run
 
 
 def launch(kernel, *, ticket, buffers=None, scalars=None, stream=None, **kwargs):
     ctx = ticket.session
+    if ctx.profile == NATIVE_PROFILE:
+        from tilelang.ascend.distributed.native import launch_native
+
+        return launch_native(kernel, ticket=ticket, buffers=buffers, scalars=scalars, stream=stream, **kwargs)
     with ctx._lock:
         _check_ticket(ctx, ticket)
         if ctx.state != "PREPARED":
@@ -86,6 +90,10 @@ def launch(kernel, *, ticket, buffers=None, scalars=None, stream=None, **kwargs)
 
 def complete(run):
     ctx = run.session
+    if ctx.profile == NATIVE_PROFILE:
+        from tilelang.ascend.distributed.native import complete_native
+
+        return complete_native(run)
     with ctx._lock:
         if run.completed:
             return run.result

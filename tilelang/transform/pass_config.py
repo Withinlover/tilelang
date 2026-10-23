@@ -76,6 +76,15 @@ class PassConfigKey(str, Enum):
     TL_ENABLE_AUTO_SCHEDULE = "tl.enable_auto_schedule"
     """Enable Ascend auto scheduling. Default: True."""
 
+    TL_ASCEND_SDK_COMPATIBILITY = "tl.ascend_sdk_compatibility"
+    """Explicit, restricted Ascend source compatibility profile. Default: native.
+
+    ``cann-9.1-gemm64`` translates only the audited BF16 64x64 Cube fragment.
+    ``cann-9.1-shmem`` selects the minimal headers for SHMEM AIV phases.
+    Unsupported generated source is rejected; this is not a general SDK shim.
+    The translated source participates in the Ascend binary cache identity.
+    """
+
     TL_ENABLE_AUTO_WARP_SPECIALIZATION = "tl.enable_auto_warp_specialization"
     """Name of the automatic warp-specialization scheduler to run (e.g.
     "role_based"). Default: unset (disabled)."""

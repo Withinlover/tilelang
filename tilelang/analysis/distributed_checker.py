@@ -58,8 +58,9 @@ def reject_native_distributed(func_or_mod):
         if found:
             fail(
                 "native transport is not certified for distributed source IR; "
-                "use tilelang.distributed.compile(..., profile='ascend950_cannsim_v1') "
-                "for explicit local protocol and CANN computation co-simulation"
+                "use tilelang.distributed.compile with profile='ascend950_cannsim_v1' "
+                "for local co-simulation or profile='ascend950_shmem_mte_phased_v1' "
+                "for explicit native SHMEM kernel phases; raw TD IR cannot enter a fused native kernel"
             )
 
 

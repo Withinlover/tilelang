@@ -13,7 +13,16 @@ from threading import RLock
 
 import numpy as np
 
-from .abi import LOCAL_PROFILE, MAX_EPOCH, SIGNAL_STRIDE_BYTES, canonical_manifest, encode_descriptor, kernel_manifest, manifest_digest
+from .abi import (
+    LOCAL_PROFILE,
+    MAX_EPOCH,
+    NATIVE_PROFILE,
+    SIGNAL_STRIDE_BYTES,
+    canonical_manifest,
+    encode_descriptor,
+    kernel_manifest,
+    manifest_digest,
+)
 
 
 class UnsupportedProfileError(ValueError):
@@ -115,13 +124,20 @@ class Session:
     _run: object = None
 
 
-def init(*, process_group=None, device=None, profile=LOCAL_PROFILE, world_size=2):
+def init(*, process_group=None, device=None, profile=LOCAL_PROFILE, world_size=2, **options):
+    if profile == NATIVE_PROFILE:
+        from tilelang.ascend.distributed.native_runtime import init_runtime
+
+        return init_runtime(profile=profile, process_group=process_group, device=device, world_size=world_size, **options)
     if profile != LOCAL_PROFILE:
         raise UnsupportedProfileError(
-            f"profile {profile!r} is not certified; only {LOCAL_PROFILE!r} supports local functional co-simulation"
+            f"profile {profile!r} is not certified; select {LOCAL_PROFILE!r} for local functional co-simulation "
+            f"or {NATIVE_PROFILE!r} for explicit native SHMEM phases"
         )
     if process_group is not None or device is not None:
         raise UnsupportedProfileError("the local profile uses one CPU coordinator; process_group and device must be None")
+    if options:
+        raise TypeError(f"unknown local session options: {sorted(options)}")
     if _positive_int(world_size, "world_size") != 2:
         raise UnsupportedProfileError("the local P0 profile currently supports exactly two logical ranks")
     return Session(world_size=world_size, profile=profile)
@@ -153,16 +169,22 @@ def _allocate(ctx, *, key, shape, dtype, remote_access, kind):
 
 
 def alloc_symmetric(ctx, *, key, shape, dtype, remote_access="read_write"):
+    if ctx.profile == NATIVE_PROFILE:
+        return ctx.allocate(key=key, shape=shape, dtype=dtype, remote_access=remote_access, kind="symmetric")
     return _allocate(ctx, key=key, shape=shape, dtype=dtype, remote_access=remote_access, kind="symmetric")
 
 
 def alloc_signals(ctx, *, key, shape, dtype="int32"):
+    if ctx.profile == NATIVE_PROFILE:
+        return ctx.allocate(key=key, shape=shape, dtype=dtype, remote_access="write", kind="signal")
     if str(dtype) != "int32":
         raise UnsupportedProfileError("the local P0 profile freezes SignalValue to int32")
     return _allocate(ctx, key=key, shape=shape, dtype=dtype, remote_access="write", kind="signal")
 
 
 def channel(ctx, *, key, peers=None):
+    if ctx.profile == NATIVE_PROFILE:
+        return ctx.channel(key=key, peers=peers)
     with ctx._lock:
         if ctx.state != "QUIESCENT":
             raise RuntimeError("channel creation requires a QUIESCENT session")
@@ -222,6 +244,8 @@ def _validate_manifest(ctx, manifest, ch):
 
 
 def prepare_launch(ctx, kernel, *, channel, epochs, protocol, parameters=None):
+    if ctx.profile == NATIVE_PROFILE:
+        return ctx.prepare(kernel, channel=channel, epochs=epochs, protocol=protocol, parameters=parameters)
     with ctx._lock:
         if ctx.state == "LOCAL_DONE":
             # One synchronous coordinator has already completed every logical rank.
@@ -270,6 +294,8 @@ def _check_ticket(ctx, ticket):
 
 def copy_in(buffer, value, *, ticket, rank=None, stream=None):
     ctx = buffer.session
+    if ctx.profile == NATIVE_PROFILE:
+        return ctx.copy_in(buffer, value, ticket=ticket, rank=rank, stream=stream)
     with ctx._lock:
         _check_ticket(ctx, ticket)
         if ctx.state != "PREPARED":
@@ -300,6 +326,8 @@ def copy_in(buffer, value, *, ticket, rank=None, stream=None):
 
 
 def close(ctx):
+    if ctx.profile == NATIVE_PROFILE:
+        return ctx.close()
     with ctx._lock:
         if ctx.state == "CLOSED":
             return

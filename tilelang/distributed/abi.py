@@ -13,6 +13,7 @@ import struct
 import numpy as np
 
 LOCAL_PROFILE = "ascend950_cannsim_v1"
+NATIVE_PROFILE = "ascend950_shmem_mte_phased_v1"
 MANIFEST_ATTR = "tl.distributed.manifest"
 DESCRIPTOR_HEADER_BYTES = 64
 DESCRIPTOR_RECORD_BYTES = 32

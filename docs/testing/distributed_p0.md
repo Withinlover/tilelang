@@ -1,20 +1,23 @@
 # P0 分布式 DSL 测试指南
 
-本指南适用于 `feat/distributed-p0-dsl` 分支的当前实现。执行前记录实际 commit；不要用分支名代替可复现版本。接口设计见 [P0 DSL 设计](../design/distributed_p0_dsl.md)，已完成的验证见 [实现记录](../design/distributed_p0_implementation_validation.md)，入口程序是 [双 rank AllGather + GEMM](../../examples/distributed/example_allgather_gemm.py)。
+本指南适用于 `feat/distributed-p0-dsl` 分支的当前实现。执行前记录实际 commit；不要用分支名代替可复现版本。接口设计见 [P0 DSL 设计](../design/distributed_p0_dsl.md)，已完成的验证见 [实现记录](../design/distributed_p0_implementation_validation.md)，本指南保留本机协议与 CANN 联仿流程，入口程序是 [双 rank AllGather + GEMM](../../examples/distributed/example_allgather_gemm.py)。**真实双卡的环境、构建、启动和验收命令见新增的 [Ascend 950 原生双卡测试指南](distributed_native.md)。**
 
 ## 1. 当前能验证什么
 
-当前唯一可执行 profile 是 `ascend950_cannsim_v1`：一个 CPU 协调器持有两个逻辑 rank，执行从同一个 TileLang PrimFunc 得到的通信协议；计算可以用 NumPy，也可以由 CANN Simulator 执行从该 PrimFunc 提取并新编译的单卡 GEMM。默认 3 轮、2 个接收槽覆盖槽复用、READY/ACK 和 epoch 递增。
+本机联仿 profile `ascend950_cannsim_v1` 由一个 CPU 协调器持有两个逻辑 rank，执行从同一个 TileLang PrimFunc 得到的通信协议；计算可以用 NumPy，也可以由 CANN Simulator 执行从该 PrimFunc 提取并新编译的单卡 GEMM。默认 3 轮、2 个接收槽覆盖槽复用、READY/ACK 和 epoch 递增。
 
-**当前没有真实双卡 transport，没有设备端 P0-A 通信 lowering，也没有 P0-B 通信调度。** `D.init` 不接受真实 process group/device/stream；`tilelang.compile`、JIT/cache 和 lowering 入口会拒绝含通信的函数。把脚本改成多进程启动、改 profile 名称或设置两个设备都不能补齐这些能力。本指南不提供当前无法运行的双卡启动命令。
+新增的 `ascend950_shmem_mte_phased_v1` 将同一 TD 源程序编译成真实 SHMEM 通信 kernel 和独立 TileLang 计算 kernel，由每 rank 的 Host/stream 顺序执行。该路径不依赖 cannsim-helper；本机已完成源码、原生构建和 Host ABI 检查，真实双卡正确性与可见性仍待用户实机验收。它不是原设计的单 kernel P0-A，也没有实现 P0-B 融合调度。
+
+`ascend950_cannsim_v1` 仍不接受设备绑定或 device stream。普通 `tilelang.compile`、JIT/cache 和 lowering 入口仍拒绝原始含 TD 的函数；原生分段路径通过显式 `D.compile(..., profile=D.NATIVE_PROFILE)` 消解 TD，再让子 kernel 复用既有编译器，不能通过删除 gate 或关闭语义检查启用。
 
 | 层次 | 是否需要 NPU | 是否需要 CANN | 是否需要扩展 helper | 证明范围 |
 | --- | --- | --- | --- | --- |
-| 前端、共享检查、Host、native gate | 否 | 否 | 否 | DSL/ABI/生命周期，以及未认证原生执行被拒绝 |
+| 前端、共享检查、Host、native gate | 否 | 否 | 否 | DSL/ABI/生命周期，以及原始 TD 不被普通 native 入口误执行 |
 | 局部片段提取和 Ascend 源码 lowering | 否 | 否 | 否 | 编译器保留受支持的真实计算语句；需要构建 Ascend 后端 |
 | 双 rank 协议模式 | 否 | 否 | 是 | CPU 模型中的协议、数据流、故障及独立全局精度 |
 | CANN 计算片段联仿 | 否 | 是，当前固定 9.1 | 是 | 上述协议加真实单卡 Simulator 计算/流水 |
-| 未来原生双卡验证 | 是 | 是 | 依未来 transport 决定 | 当前阻塞，条件见第 8 节 |
+| 原生分段源码、构建与 Host ABI | 否 | 构建时需要 | 否 | SHMEM 通信/计算子 kernel 的生成、真实编译和 ABI；不证明设备执行 |
+| 原生双卡验证 | 是 | 是，另需固定 SHMEM | 否 | 按[原生测试指南](distributed_native.md)在两张 950 上验收；本机未执行 |
 
 所有命令在 Bash 中、仓库根目录运行，除非另有说明。输出目录由 `P0_OUTPUT_DIR` 指定；原始输入、输出、IR、生成代码和 trace 都可能包含业务信息，应保留在获准的本地目录。
 
@@ -42,7 +45,7 @@ git submodule status --recursive > "$P0_OUTPUT_DIR/submodules.txt"
 python -c 'import tilelang; print(tilelang.__file__); print(tilelang.__version__)'
 ```
 
-本地 stub 配置允许没有 CANN 的机器加载 Ascend 编译器；它不提供 NPU runtime。CANN Simulator 在 helper 的独立进程中运行，不把 stub 当作真实设备实现。未来实机安装需要匹配的驱动、CANN、PyTorch/`torch_npu` 和真实 runtime，参照 [Ascend 后端安装](../../tilelang/ascend/README.md)。
+本地 stub 配置允许没有 CANN 的机器加载 Ascend 编译器；它不提供 NPU runtime。CANN Simulator 在 helper 的独立进程中运行，不把 stub 当作真实设备实现。实机安装需要匹配的驱动、CANN、PyTorch/`torch_npu`、固定 SHMEM 和真实 runtime，参照 [原生测试指南](distributed_native.md)及 [Ascend 后端安装](../../tilelang/ascend/README.md)。
 
 切换 commit、改变 TVM 子模块或修改 C++ 后必须重建；已配置的开发构建可执行 `cmake --build build --parallel`。如果安装器选择了其他构建目录，以配置日志为准。Python 从仓库根目录导入时通常加载当前 checkout 和 `build` 下的 native 库，不能用旧 wheel 的成功导入证明新 C++ 已生效。不要覆盖子模块中已有的未提交改动。
 
@@ -68,7 +71,7 @@ python -m pytest -q \
 
 `test_segments.py` 需要已启用的 Ascend lowering/codegen，但不调用 Bisheng 或 CANN。`test_worker.py` 仅在 Linux 上启动可控的假 worker/native 进程，验证无响应时的进程组清理；它不是设备执行测试。
 
-当前机器和未来实机都可以运行下面的 native gate smoke：
+本机和实机都可以运行下面的 native gate smoke：
 
 ```bash
 python -m pytest -q \
@@ -76,7 +79,7 @@ python -m pytest -q \
   -k 'native_public_entries_gate_before_target_resolution and ascend'
 ```
 
-预期四个公开入口在后端解析、编译或设备提交前抛出包含 `native transport is not certified` 的 `ValueError`，由测试捕获后显示通过。这里的“通过”表示安全拒绝生效，**不是原生通信已经执行**。不要把移除 gate 或关闭语义检查作为让实机运行的步骤。
+预期四个普通公开入口在后端解析、编译或设备提交前拒绝原始 TD 函数，由测试捕获后显示通过。这里的“通过”表示入口限制生效，**不是原生通信已经执行**。显式原生 profile 使用另一条受检查的分段路径；不要移除 gate 或关闭语义检查。
 
 不建议以整套 `testing/python` 作为无设备机器的准入命令。部分既有测试需要实际 GPU 或固定 CUDA 架构；应将环境不满足、skip 和真正的语义回归分别报告。
 
@@ -225,20 +228,17 @@ test "$P0_NEGATIVE_STATUS" -eq 1
 | 仿真 | CANN Toolkit、Bisheng/linker 版本，Simulator/model 版本或 hash、编译 profile、SOC/arch |
 | 用例 | mode、profile、rounds、slots、seed、故障、consumer delay、timeout、容差 |
 | 结果 | 退出码、所有验收字段、日志、IR/ELF/输入输出 hash、trace 完整性 |
-| 未来实机附加项 | 驱动/固件、设备具体型号、逻辑 rank 到物理卡映射、peer 拓扑、transport/ABI 版本 |
+| 实机附加项 | 驱动/固件、设备具体型号、逻辑 rank 到物理卡映射、peer 拓扑、transport/ABI 版本 |
 
 没有网络的保密环境应先通过获准渠道准备源码与全部子模块、匹配的 helper、适合目标平台的依赖 wheelhouse、CANN 安装介质和版本清单。不要把另一台机器的 `.venv` 或未经确认的编译对象当作可复现环境。安装后重新构建并运行第 3 节，再逐层执行协议和联仿。
 
 离线 pip 安装可通过 `PIP_NO_INDEX=1` 与 `PIP_FIND_LINKS="$P0_WHEELHOUSE"` 使用已准备的 wheelhouse；缺少依赖应作为环境准备失败报告，不自动联网补齐。生成的 IR、输入/输出、地址信息、日志和流水全部留在保密环境内，按当地规则审阅后再决定是否导出脱敏摘要。测试命令不包含上传、遥测或推送产物的步骤。
 
-## 8. 未来真实双卡验证：阻塞条件与矩阵
+## 8. 原生双卡入口与后续验证矩阵
 
-以下是未来 transport 实现后的验收计划，当前分支不能执行。安装两张卡本身不会解除这些阻塞：
+原生分段 profile 的环境准备、固定 SHMEM 版本、源码/编译检查、真实启动器和正反例验收，见 [Ascend 950 原生双卡测试指南](distributed_native.md)。它已经实现设备通信子 kernel、对称内存与 peer 映射、Host 多进程一致性预检、独立 stream、超时监督及正常关闭协议；不能把这些本机编译结果写成实机通过。
 
-1. 固定并审查具体 950 硬件/软件/拓扑元组，提供 peer 映射、信号原子完整性、payload 发布/获取、put/get 完成域和进度保证的契约依据。
-2. 实现有版本门控的真实 transport/profile、设备通信 lowering、匹配的 descriptor/注册资源、Host 多进程一致性预检和 stream/失败回收；不能仅将现有 CPU profile 标为 hardware。
-3. 给出真实 kernel 的生成代码与 SDK ABI 审查，完成 event/scratch 资源规划；设备 API 的名称或单次成功运行不能替代可见性证明。
-4. 为实现后的启动器和 process group 增加真实命令、超时、故障终止和报告收集；未实现前保留 native gate。P0-B 还必须实现通信 effect 到 AutoSchedule/InsertSync/MultiBuffer 的接入。
+下表保留完整原生能力的验收矩阵。其中 put/get、slot 复用、多次 launch 和分段 GEMM 已有测试入口；热点缓存压力、更广 dtype/shape、单 kernel P0-A、P0-B 融合和性能结论仍需对应扩展或实机证据。每台机器仍须核对具体 950 硬件/软件/拓扑元组，确认 peer 路径和完成/可见性契约匹配。
 
 满足各层先决条件后，按顺序验证；上一层未通过时不将下一层结果作为认证。
 
@@ -249,7 +249,7 @@ test "$P0_NEGATIVE_STATUS" -eq 1
 | 信号和 slot | READY/ACK，S=1/2；N=0、N<S、N=S、N>S；两侧交替延迟、不同合法消息大小 | 零覆写未消费 slot、零提前 ACK；尾部 drain；N=0 提供明确空工作路径后方可执行 |
 | 多次 launch 与 ABI | 不清零信号连续运行；新 Session/进程；epoch 接近上限；参数/拓扑不一致 | epoch 单调且提交前拒绝回绕；无旧地址；不一致参数在任何 rank 提交前拒绝 |
 | 故障和退出 | 丢通知、对端停止、超时、注册/编译失败；重复 create/close | 有界失败、保留 rank/epoch/等待上下文；无后台设备提交、悬挂进程或资源泄漏 |
-| 端到端通信 + GEMM，先拆分 kernel | P0-A 先由 Host 编排通信 kernel 与独立本地 GEMM；原始全局输入 oracle、多个 seed、实际消费远端数据、通信污染负例 | 所有输出和 dtype 容差通过，零漏写/非有限值；故障对照被全局校验拒绝；明确此层不是含通信的融合 kernel |
+| 端到端通信 + GEMM，分段 profile | 由 Host 编排 SHMEM 通信 kernel 与独立本地 GEMM；原始全局输入 oracle、多个 seed、实际消费远端数据、通信污染负例 | 所有输出和 dtype 容差通过，零漏写/非有限值；故障对照被全局校验拒绝；明确此层不是含通信的融合 kernel |
 | P0-B 融合 | AIV 通信→Cube acquire、Cube 读取完成→AIV ACK；Stage/流水、UB/L1 压力与多缓冲 | 调度/资源检查通过；零提前覆盖/死锁；融合 kernel 的所有 rank 输出正确 |
 | 压力与性能 | 在已认证拓扑内扩大迭代/消息规模；与 Host 集合通信编排基线对比 | 记录 seed/次数/最长等待，正确性零异常；分别报告最慢 rank、端到端时间、初始化成本、峰值资源 |
 
