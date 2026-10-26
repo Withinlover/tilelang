@@ -7,7 +7,7 @@ only. Importing this module does not load SHMEM, Torch NPU, or initialize ACL.
 from __future__ import annotations
 
 import ctypes
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 from functools import wraps
 import hashlib
@@ -21,6 +21,7 @@ import socket
 import subprocess
 import tempfile
 from threading import RLock
+from types import MappingProxyType
 from urllib.parse import urlparse
 
 import numpy as np
@@ -46,6 +47,21 @@ def _locked(method):
 
 def _json(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def _allocation_layout(*, shape, dtype, remote_access, kind):
+    shape = tuple(_positive_int(x, "shape extent") for x in shape)
+    if not shape or kind not in ("symmetric", "signal") or remote_access not in ("read", "write", "read_write"):
+        raise ValueError("invalid native symmetric allocation specification")
+    dtype = str(dtype)
+    itemsize = _storage_dtype(dtype).itemsize
+    if kind == "signal":
+        if dtype != "int32":
+            raise ValueError("native SignalValue must be int32")
+        remote_access = "write"
+    nbytes = math.prod(shape) * (SIGNAL_STRIDE_BYTES if kind == "signal" else itemsize)
+    strides = tuple(s * (SIGNAL_STRIDE_BYTES // itemsize if kind == "signal" else 1) for s in _contiguous_strides(shape))
+    return shape, dtype, remote_access, nbytes, strides
 
 
 def _loopback_bootstrap(value):
@@ -321,6 +337,19 @@ class NativeBuffer:
 
 
 @dataclass(frozen=True, eq=False)
+class NativeBinding:
+    """One program's persistent allocations in the Session's fixed SHMEM heap."""
+
+    session: NativeSession
+    kernel: object
+    key: str
+    objects: MappingProxyType
+    channel: Channel
+    manifest_digest: str
+    signal_values: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True, eq=False)
 class NativeTicket:
     session: NativeSession
     kernel: object
@@ -333,6 +362,7 @@ class NativeTicket:
     parameters: dict
     manifest: dict
     manifest_digest: str
+    binding: NativeBinding | None = None
 
     @property
     def epochs(self):
@@ -361,6 +391,7 @@ class NativeSession:
         self.shmem_root, self.shmem_library = shmem_root, shmem_library
         self.abi_fingerprint = bridge.fingerprint
         self.objects, self.channels = {}, {}
+        self._bindings = {}
         self._epoch = self._launch_id = 0
         self._ticket = None
         self._allocated_bytes = 0
@@ -417,13 +448,33 @@ class NativeSession:
         if hasattr(self.bridge, "activate"):
             self.bridge.activate(self.device)
 
+    def __enter__(self):
+        if self.state in ("CLOSED", "FAILED"):
+            raise RuntimeError(f"cannot enter a native Session in {self.state}")
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if exc_type is not None:
+            # An escaping rank error must not enter a cleanup collective or
+            # free storage that another rank might still access.
+            self.fail(exc_value)
+        elif self.state != "FAILED":
+            self.close()
+        return False
+
     @_locked
     def preflight(self, payload):
         try:
             payload = canonical_manifest(payload)
             gathered = self.control.all_gather(payload)
             if len(gathered) != self.world_size or any(item != payload for item in gathered):
-                raise ValueError("native cross-rank metadata mismatch; no kernel may be launched")
+                failures = [
+                    f"rank {rank}: {str(item['error'])[:2048]}"
+                    for rank, item in enumerate(gathered)
+                    if isinstance(item, dict) and item.get("error")
+                ]
+                details = "; " + "; ".join(failures) if failures else ""
+                raise ValueError("native cross-rank metadata mismatch; no kernel may be launched" + details)
         except Exception as error:
             self.fail(error)
             raise
@@ -440,19 +491,9 @@ class NativeSession:
             raise RuntimeError("symmetric allocation requires a QUIESCENT session")
         if not isinstance(key, str) or not key or key in self.objects:
             raise ValueError("symmetric object keys must be nonempty and unique")
-        shape = tuple(_positive_int(x, "shape extent") for x in shape)
-        if not shape or kind not in ("symmetric", "signal") or remote_access not in ("read", "write", "read_write"):
-            raise ValueError("invalid native symmetric allocation specification")
-        dtype = str(dtype)
-        itemsize = _storage_dtype(dtype).itemsize
-        if kind == "signal":
-            if dtype != "int32":
-                raise ValueError("native SignalValue must be int32")
-            remote_access = "write"
-        nbytes = math.prod(shape) * (SIGNAL_STRIDE_BYTES if kind == "signal" else itemsize)
+        shape, dtype, remote_access, nbytes, strides = _allocation_layout(shape=shape, dtype=dtype, remote_access=remote_access, kind=kind)
         if self._allocated_bytes + nbytes > self.heap_bytes:
             raise MemoryError("native symmetric allocations exceed the configured heap capacity")
-        strides = tuple(s * (SIGNAL_STRIDE_BYTES // itemsize if kind == "signal" else 1) for s in _contiguous_strides(shape))
         self.preflight(
             {
                 "allocate": key,
@@ -479,6 +520,105 @@ class NativeSession:
             raise
 
     @_locked
+    def bind(self, kernel, *, key=None):
+        """Collectively cache isolated program resources without resizing the heap.
+
+        Every rank must bind programs in the same order, including cache hits.
+        Allocations remain owned by the Session until it closes.
+        """
+        from tilelang.distributed.session import _validate_manifest
+
+        if self.state not in ("QUIESCENT", "LOCAL_DONE"):
+            raise RuntimeError(f"bind requires a quiescent or completed session; found {self.state}")
+        manifest = kernel_manifest(kernel)
+        digest = manifest_digest(manifest)
+        key = digest if key is None else key
+        if not isinstance(key, str) or not key:
+            raise ValueError("binding key must be a nonempty string")
+        cached = self._bindings.get(key)
+        # Checking cache state collectively prevents one rank returning while
+        # another rank enters symmetric allocation collectives.
+        self.preflight(
+            {
+                "bind": key,
+                "manifest": digest,
+                "cached": cached is not None,
+                "allocated_bytes": self._allocated_bytes,
+                "heap_bytes": self.heap_bytes,
+                "launch_id": self._launch_id,
+            }
+        )
+        if cached is not None:
+            if cached.manifest_digest != digest:
+                raise ValueError("binding key is already associated with a different program manifest")
+            self._check_binding(cached)
+            return cached
+
+        channels = manifest.get("channels", [])
+        if len(channels) != 1 or not isinstance(channels[0].get("name"), str) or not channels[0]["name"]:
+            raise ValueError("native bindings require one named channel")
+        channel_key = channels[0]["name"]
+        peers = {0: (1,), 1: (0,)}
+        channel = self.channels.get(channel_key, Channel(self, channel_key, peers))
+        if channel.session is not self or channel.peers != peers:
+            raise ValueError("native binding channel must contain the complete two-rank topology")
+        namespace = hashlib.sha256(key.encode()).hexdigest()
+        layouts = {}
+        for spec in manifest.get("objects", []):
+            logical_key = spec["key"]
+            if not isinstance(logical_key, str) or not logical_key or logical_key in layouts:
+                raise ValueError("binding manifest requires unique nonempty object keys")
+            physical_key = f"__binding__/{namespace}/{logical_key}"
+            if physical_key in self.objects:
+                raise ValueError("binding allocation namespace conflicts with an existing allocation")
+            shape, dtype, remote_access, nbytes, strides = _allocation_layout(
+                shape=spec["shape"], dtype=spec["dtype"], remote_access=spec["remote_access"], kind=spec["kind"]
+            )
+            # These address-free layout records validate the entire manifest
+            # and heap budget before the first device allocation.
+            layouts[logical_key] = NativeBuffer(self, physical_key, shape, dtype, remote_access, spec["kind"], 0, nbytes, strides)
+        _validate_manifest(self, manifest, channel, objects=layouts)
+        required = sum(obj.physical_nbytes for obj in layouts.values())
+        self.preflight({"bind_capacity": key, "required_bytes": required, "available_bytes": self.heap_bytes - self._allocated_bytes})
+        if self._allocated_bytes + required > self.heap_bytes:
+            raise MemoryError(
+                f"binding requires {required} bytes but the fixed SHMEM heap has "
+                f"{self.heap_bytes - self._allocated_bytes} bytes available; recreate the Session with a larger heap_bytes"
+            )
+        # LOCAL_DONE includes the previous launch's collective completion.
+        self.state = "QUIESCENT"
+        objects = {
+            logical_key: self.allocate(key=obj.key, shape=obj.shape, dtype=obj.dtype, remote_access=obj.remote_access, kind=obj.kind)
+            for logical_key, obj in layouts.items()
+        }
+        self.channels[channel_key] = channel
+        signal_values = {
+            (rank, logical_key, index): 0
+            for logical_key, obj in objects.items()
+            if obj.kind == "signal"
+            for rank in range(self.world_size)
+            for index in range(math.prod(obj.shape))
+        }
+        binding = NativeBinding(self, kernel, key, MappingProxyType(objects), channel, digest, signal_values)
+        self._bindings[key] = binding
+        return binding
+
+    def _check_binding(self, binding):
+        from tilelang.distributed.session import _validate_manifest
+
+        if not isinstance(binding, NativeBinding) or binding.session is not self or self._bindings.get(binding.key) is not binding:
+            raise ValueError("binding is stale or belongs to another session")
+        manifest = kernel_manifest(binding.kernel)
+        if manifest_digest(manifest) != binding.manifest_digest:
+            raise ValueError("bound program manifest was modified")
+        if self.channels.get(binding.channel.key) is not binding.channel:
+            raise ValueError("binding channel is no longer registered with its Session")
+        for obj in binding.objects.values():
+            if obj.session is not self or self.objects.get(obj.key) is not obj:
+                raise ValueError("bound allocation is no longer owned by its Session")
+        _validate_manifest(self, manifest, binding.channel, objects=binding.objects)
+
+    @_locked
     def channel(self, *, key, peers=None):
         if self.state != "QUIESCENT" or self.channels:
             raise RuntimeError("P0 channel creation requires a QUIESCENT session with no existing channel")
@@ -492,7 +632,7 @@ class NativeSession:
         return result
 
     @_locked
-    def prepare(self, kernel, *, channel, epochs, protocol, parameters=None):
+    def prepare(self, kernel, *, channel, epochs, protocol, parameters=None, binding=None):
         if self.state == "LOCAL_DONE":
             self.state = "QUIESCENT"
         if self.state != "QUIESCENT":
@@ -510,7 +650,11 @@ class NativeSession:
         # Reuse the shared manifest binding contract; it is independent of storage ownership.
         from tilelang.distributed.session import _validate_manifest
 
-        _validate_manifest(self, manifest, channel)
+        if binding is not None:
+            self._check_binding(binding)
+            if kernel is not binding.kernel or channel is not binding.channel:
+                raise ValueError("prepare must use the bound program and channel")
+        _validate_manifest(self, manifest, channel, objects=None if binding is None else binding.objects)
         parameters = canonical_manifest({} if parameters is None else parameters)
         launch_id, end = self._launch_id + 1, self._epoch + epochs
         prim_func = getattr(kernel, "prim_func", None)
@@ -531,15 +675,33 @@ class NativeSession:
                 "protocol": protocol,
                 "parameters": parameters,
                 "manifest": digest,
+                "binding": None if binding is None else binding.key,
             }
         )
-        ticket = NativeTicket(self, kernel, channel, self.generation, launch_id, self._epoch, end, protocol, parameters, manifest, digest)
+        ticket = NativeTicket(
+            self, kernel, channel, self.generation, launch_id, self._epoch, end, protocol, parameters, manifest, digest, binding
+        )
         self._ticket, self._epoch, self._launch_id, self.state = ticket, end, launch_id, "PREPARED"
         return ticket
 
     def check_ticket(self, ticket):
         if ticket.session is not self or self._ticket is not ticket or ticket.generation != self.generation:
             raise ValueError("ticket is stale or belongs to another session")
+
+    @_locked
+    def ticket_buffers(self, ticket):
+        """Resolve logical argument names to this ticket's Session-owned buffers."""
+        self.check_ticket(ticket)
+        if manifest_digest(ticket.manifest) != ticket.manifest_digest:
+            raise ValueError("prepared manifest was modified")
+        if manifest_digest(kernel_manifest(ticket.kernel)) != ticket.manifest_digest:
+            raise ValueError("prepared program manifest was modified")
+        if ticket.binding is not None:
+            self._check_binding(ticket.binding)
+            if ticket.kernel is not ticket.binding.kernel or ticket.channel is not ticket.binding.channel:
+                raise ValueError("ticket does not match its program binding")
+            return dict(ticket.binding.objects)
+        return {spec["key"]: self.objects[spec["key"]] for spec in ticket.manifest["objects"]}
 
     @_locked
     def copy_in(self, buffer, value, *, ticket, rank=None, stream=None):
@@ -550,7 +712,7 @@ class NativeSession:
             raise ValueError("native copy_in accepts only the local rank's array and the session-owned stream")
         if buffer.kind == "signal":
             raise ValueError("signals cannot be overwritten by copy_in")
-        if buffer.key not in {obj["key"] for obj in ticket.manifest["objects"]}:
+        if not any(buffer is obj for obj in self.ticket_buffers(ticket).values()):
             raise ValueError("copy_in buffer is not bound by the kernel manifest")
         array = np.asarray(value)
         if array.shape != buffer.shape or array.dtype != _storage_dtype(buffer.dtype):
@@ -628,6 +790,7 @@ class NativeSession:
         try:
             self.bridge.close([obj.pointer for obj in self.objects.values()], self.stream)
             self.state, self._ticket = "CLOSED", None
+            self._bindings.clear()
             global _ACTIVE_NATIVE_SESSION
             with _NATIVE_SESSION_LOCK:
                 if _ACTIVE_NATIVE_SESSION is self:

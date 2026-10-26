@@ -115,6 +115,41 @@ def make_ticket(session, epochs=3):
     return session.prepare(kernel, channel=channel, epochs=epochs, protocol="test-v1"), data, signal
 
 
+def binding_program(width=4, channel="comm"):
+    return SimpleNamespace(
+        manifest={
+            "schema_version": 1,
+            "profile": NATIVE_PROFILE,
+            "groups": [{"name": "world", "size": 2}],
+            "channels": [{"name": channel, "group": "world"}],
+            "objects": [
+                {
+                    "key": "Data",
+                    "shape": [2, width],
+                    "dtype": "float32",
+                    "kind": "symmetric",
+                    "remote_access": "read_write",
+                    "strides": [width, 1],
+                    "physical_nbytes": 8 * width,
+                    "alignment": 64,
+                    "group": "world",
+                },
+                {
+                    "key": "Ready",
+                    "shape": [2],
+                    "dtype": "int32",
+                    "kind": "signal",
+                    "remote_access": "write",
+                    "strides": [16],
+                    "physical_nbytes": 128,
+                    "alignment": 64,
+                    "group": "world",
+                },
+            ],
+        }
+    )
+
+
 def test_bootstrap_metadata_mismatch_never_initializes_device():
     control, bridge = Control(), Bridge()
     original = control.all_gather
@@ -189,6 +224,106 @@ def test_ticket_copy_and_epoch_reuse(session):
     session.close()
     session.close()
     assert sum(call[0] == "close" for call in session.bridge.calls) == 1
+
+
+def test_binding_reuses_cached_blocks_and_isolates_program_signatures(session):
+    first = session.bind(binding_program())
+    assert set(first.objects) == {"Data", "Ready"}
+    assert first.signal_values == {(rank, "Ready", index): 0 for rank in range(2) for index in range(2)}
+    with pytest.raises(TypeError):
+        first.objects["Data"] = first.objects["Ready"]
+    ticket = session.prepare(first.kernel, channel=first.channel, epochs=3, protocol="test-v1", binding=first)
+    values = np.arange(8, dtype=np.float32).reshape(2, 4)
+    session.copy_in(first.objects["Data"], values, ticket=ticket)
+    assert session.ticket_buffers(ticket) == dict(first.objects)
+    session.mark_running(ticket)
+    session.mark_complete(ticket)
+
+    allocations = sum(call[0] == "allocate" for call in session.bridge.calls)
+    collectives = len(session.control.payloads)
+    assert session.bind(binding_program()) is first
+    assert len(session.control.payloads) > collectives
+    assert sum(call[0] == "allocate" for call in session.bridge.calls) == allocations
+    second = session.bind(binding_program(width=8, channel="other"))
+    assert first.channel.key == "comm" and second.channel.key == "other"
+    assert first.objects["Data"].pointer != second.objects["Data"].pointer
+    assert first.objects["Ready"].pointer != second.objects["Ready"].pointer
+    assert len(session.objects) == 4
+    ticket = session.prepare(second.kernel, channel=second.channel, epochs=2, protocol="test-v1", binding=second)
+    with pytest.raises(ValueError, match="not bound"):
+        session.copy_in(first.objects["Data"], values, ticket=ticket)
+    session.copy_in(second.objects["Data"], np.ones((2, 8), dtype=np.float32), ticket=ticket)
+    np.testing.assert_array_equal(session.copy_out(first.objects["Data"]), values)
+    session.mark_running(ticket)
+    session.mark_complete(ticket)
+
+    ticket = session.prepare(first.kernel, channel=first.channel, epochs=1, protocol="test-v1", binding=first)
+    assert (ticket.base, ticket.end) == (5, 6)
+    assert session.ticket_buffers(ticket)["Data"] is first.objects["Data"]
+    session.close()
+    assert not session._bindings
+    assert sum(call[0] == "initialize" for call in session.bridge.calls) == 1
+    assert sum(call[0] == "close" for call in session.bridge.calls) == 1
+
+
+def test_binding_preflights_total_fixed_heap_capacity_before_allocating(session):
+    first = session.bind(binding_program())
+    session.heap_bytes = 351  # 160 bytes allocated; the second binding needs 192.
+    before = len(session.objects)
+    with pytest.raises(MemoryError, match="fixed SHMEM heap"):
+        session.bind(binding_program(width=8))
+    assert len(session.objects) == before
+    assert session._allocated_bytes == 160
+    assert list(session._bindings.values()) == [first]
+    assert sum(call[0] == "allocate" for call in session.bridge.calls) == 2
+    assert session.state == "QUIESCENT"
+
+
+def test_binding_cache_disagreement_fails_before_any_device_allocation(session):
+    gather = session.control.all_gather
+
+    def disagree(payload):
+        peers = gather(payload)
+        if "bind" in payload:
+            peers[1]["cached"] = not payload["cached"]
+        return peers
+
+    session.control.all_gather = disagree
+    with pytest.raises(ValueError, match="metadata mismatch"):
+        session.bind(binding_program())
+    assert session.state == "FAILED"
+    assert not session.objects
+    assert not any(call[0] == "allocate" for call in session.bridge.calls)
+
+
+def test_binding_key_and_ticket_cannot_rebind_another_program(session):
+    first = session.bind(binding_program(), key="operator")
+    with pytest.raises(ValueError, match="different program manifest"):
+        session.bind(binding_program(width=8), key="operator")
+    other = session.bind(binding_program(), key="independent")
+    assert other.objects["Data"] is not first.objects["Data"]
+    with pytest.raises(ValueError, match="bound program and channel"):
+        session.prepare(other.kernel, channel=first.channel, epochs=1, protocol="test-v1", binding=first)
+    assert session._ticket is None and session._epoch == 0
+    ticket = session.prepare(first.kernel, channel=first.channel, epochs=1, protocol="test-v1", binding=first)
+    first.kernel.manifest["objects"][0]["remote_access"] = "read"
+    with pytest.raises(ValueError, match="manifest was modified"):
+        session.copy_in(first.objects["Data"], np.zeros((2, 4), dtype=np.float32), ticket=ticket)
+    assert not session.bridge.memory[first.objects["Data"].pointer].any()
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_session_context_closes_success_and_preserves_escaping_error(session, fail):
+    if fail:
+        with pytest.raises(ValueError, match="original rank failure"), session:
+            session.bind(binding_program())
+            raise ValueError("original rank failure")
+        assert session.state == "FAILED" and len(session.objects) == 2
+        assert not any(call[0] == "close" for call in session.bridge.calls)
+    else:
+        with session:
+            session.bind(binding_program())
+        assert session.state == "CLOSED" and not session._bindings
 
 
 def test_epoch_overflow_rejected_before_collective(session):

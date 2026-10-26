@@ -4,6 +4,8 @@
 
 本机协议与 CANN 联仿见 [P0 分布式 DSL 测试指南](../../docs/testing/distributed_p0.md)；真实双卡的构建、启动、正反例及报告验收见 [Ascend 950 原生双卡测试指南](../../docs/testing/distributed_native.md)。接口与实现边界见 [设计文档](../../docs/design/distributed_p0_dsl.md) 和 [实现记录](../../docs/design/distributed_p0_implementation_validation.md)。
 
+希望像普通算子一样调用时，使用 [example_jit.py](example_jit.py)：用 `@D.jit` 包装工厂函数，再将特化结果 `.bind(session)`，即可自动管理共享对称堆中的算子专属 workspace、信号和 epoch，并取得独立的 NumPy 输出。双 rank 启动方式、A → B → A 示例及第一版边界见 [分布式 JIT 指南](../../docs/testing/distributed_jit.md)。
+
 联仿 profile `ascend950_cannsim_v1` 使用 CPU 通信模型；`protocol` 模式用 NumPy 计算，`rank-segments` 模式新编译源 TIR 中的 GEMM 并运行独立 CANN Simulator 片段。两种模式均不执行真实双卡传输，也不支持 P0-B 通信调度。
 
 在仓库根目录、已构建 TileLang 并设置匹配扩展工具的 `CANNSIM_ROOT` 后运行：

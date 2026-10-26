@@ -21,6 +21,7 @@ from .session import (
     init,
     prepare_launch,
 )
+from .jit import BoundDistributedKernel, DistributedJIT, DistributedKernel, jit
 
 
 def compile(program, *, profile=LOCAL_PROFILE, **kwargs):
@@ -35,7 +36,10 @@ def compile(program, *, profile=LOCAL_PROFILE, **kwargs):
 
 
 __all__ = [
+    "BoundDistributedKernel",
     "Channel",
+    "DistributedJIT",
+    "DistributedKernel",
     "LaunchTicket",
     "LOCAL_PROFILE",
     "NATIVE_PROFILE",
@@ -52,6 +56,7 @@ __all__ = [
     "complete",
     "copy_in",
     "init",
+    "jit",
     "launch",
     "prepare_launch",
 ]

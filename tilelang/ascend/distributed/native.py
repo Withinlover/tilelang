@@ -76,6 +76,7 @@ class NativeCompiledProgram:
         output_dir=None,
         shmem_root=None,
         transport_compile_profile="native",
+        debug=True,
     ):
         if transport_compile_profile not in ("native", "cann-9.1-shmem"):
             fail(f"unsupported transport compile profile {transport_compile_profile!r}")
@@ -110,6 +111,7 @@ class NativeCompiledProgram:
             "transport_header_sha256": self.header_fingerprint,
         }
         self.profile, self.mode, self.compile_profile = profile, mode, compile_profile
+        self.debug = debug
         self.output_dir = Path(output_dir or "output/distributed/native").expanduser().resolve()
         self._specs = {entry["key"]: entry for entry in self.manifest["objects"]}
         if len(self._specs) != len(self.manifest["objects"]):
@@ -129,7 +131,7 @@ class NativeCompiledProgram:
         macro = shmem_include_flags(shmem_root)[-1]
         return macro.removeprefix("-DTL_SHMEM_HEADER_DIGEST_").removesuffix("=1")
 
-    def plan(self, *, scalars=None, epoch_base=0, epoch_end=None):
+    def plan(self, *, scalars=None, epoch_base=0, epoch_end=None, initial_signals=None):
         """Validate every rank and phase before any device request is submitted."""
         if tvm.ir.save_json(self.prim_func) != self.ir_json or manifest_digest(self.manifest) != self._manifest_digest:
             fail("compiled distributed source or execution manifest was modified")
@@ -193,20 +195,24 @@ class NativeCompiledProgram:
                         fail("native transfers require exactly one local endpoint and the other rank")
                     if self._specs[source.key]["dtype"] != self._specs[destination.key]["dtype"] or source.count != destination.count:
                         fail("native transfer endpoints require equal dtype and count")
-        self._check_progress(plans, epoch_base)
+        self._check_progress(plans, epoch_base, initial_signals=initial_signals)
         return plans
 
     @staticmethod
-    def _check_progress(plans, epoch_base):
+    def _check_progress(plans, epoch_base, *, initial_signals=None):
         """Reject a proven wait cycle in this finite, conservatively drained plan.
 
         Previous launches can only have published values <= epoch_base. Taking
         that upper bound as every initial signal is optimistic: a stalled plan
         cannot be rescued by an actual older value. A successful traversal is
         not a proof of payload leases, data races or physical transport progress.
+        A managed binding supplies its known signal state instead, including
+        zero-valued cells in a newly allocated workspace. Such cells cannot
+        inherit another binding's publications just because epochs advanced.
         """
         positions = {rank: 0 for rank in plans}
-        signals = {}
+        signals = {} if initial_signals is None else dict(initial_signals)
+        initial_value = epoch_base if initial_signals is None else 0
         while any(positions[rank] < len(plan) for rank, plan in plans.items()):
             progressed = False
             waiting = []
@@ -217,20 +223,22 @@ class NativeCompiledProgram:
                 kind, *args = instructions[index]
                 if kind == "wait_signal":
                     ref, expected, _ = args
-                    observed = signals.get(ref, epoch_base)
+                    observed = signals.get((ref.rank, ref.key, ref.index), initial_value)
                     if observed < expected:
                         waiting.append(f"rank {rank} waits {ref.key}[{ref.index}] >= {expected}, published <= {observed}")
                         continue
                 if kind in ("signal", "put_signal"):
                     ref, value = (args[0], args[1]) if kind == "signal" else (args[3], args[4])
-                    previous = signals.get(ref, epoch_base)
+                    key = (ref.rank, ref.key, ref.index)
+                    previous = signals.get(key, initial_value)
                     if value < previous:
                         fail(f"native sequential signal values must not decrease for {ref.key}[{ref.index}]")
-                    signals[ref] = value
+                    signals[key] = value
                 positions[rank] += 1
                 progressed = True
             if not progressed:
                 fail("native finite plan has a definite signal wait deadlock: " + "; ".join(waiting))
+        return signals
 
     def _validate_ref(self, ref):
         if ref.rank not in (0, 1) or ref.key not in self._specs:
@@ -371,12 +379,19 @@ class NativeCompiledProgram:
             fail("native compiled profile and Session do not match")
         if manifest_digest(ticket.manifest) != self._manifest_digest or ticket.kernel is not self:
             fail("native launch ticket does not bind this compiled program")
-        bound = dict(session.objects if buffers is None else buffers)
+        binding = getattr(ticket, "binding", None)
+        registered = session.ticket_buffers(ticket) if hasattr(session, "ticket_buffers") else session.objects
+        bound = dict(registered if buffers is None else buffers)
         if set(bound) != set(self._specs):
             fail("native buffer bindings must match exactly the compiled symmetric objects")
-        plans = self.plan(scalars=scalars, epoch_base=ticket.base, epoch_end=ticket.end)
+        plans = self.plan(
+            scalars=scalars,
+            epoch_base=ticket.base,
+            epoch_end=ticket.end,
+            initial_signals=None if binding is None else binding.signal_values,
+        )
         for key in self._specs:
-            if key not in bound or bound[key] is not session.objects.get(key):
+            if key not in bound or bound[key] is not registered.get(key):
                 fail(f"native binding {key!r} must use its Session-owned symmetric allocation")
         if session.rank not in (0, 1):
             fail("native Session rank is outside the static group")
@@ -395,20 +410,26 @@ class NativeCompiledProgram:
         )
         build_error = None
         try:
-            self.build(shmem_root=session.shmem_root, plans=plans, output_dir=self.output_dir / f"compiled_rank{session.rank}")
+            self.build(
+                shmem_root=session.shmem_root,
+                plans=plans,
+                output_dir=self.output_dir / f"compiled_rank{session.rank}" if self.debug else None,
+            )
         except Exception as error:
             build_error = error
         session.preflight({"compiled": build_error is None, "error": None if build_error is None else str(build_error)})
         if build_error is not None:
             raise build_error
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        directory = Path(tempfile.mkdtemp(prefix=f"native_rank{session.rank}_", dir=self.output_dir))
-        _json(directory / "plan.json", plan_json[str(session.rank)])
-        _json(directory / "abi.json", self.manifest)
-        (directory / "program.json").write_text(self.ir_json)
+        directory = None
+        if self.debug:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            directory = Path(tempfile.mkdtemp(prefix=f"native_rank{session.rank}_", dir=self.output_dir))
+            _json(directory / "plan.json", plan_json[str(session.rank)])
+            _json(directory / "abi.json", self.manifest)
+            (directory / "program.json").write_text(self.ir_json)
         report = {
             "profile": self.profile,
-            "run_dir": str(directory),
+            "run_dir": None if directory is None else str(directory),
             "rank": session.rank,
             "source_sha256": self.source_sha256,
             "epoch_base": ticket.base,
@@ -466,13 +487,17 @@ class NativeCompiledProgram:
                     fail(f"unhandled native phase {kind}")
                 report["phases"].append({"index": index, "op": kind})
             session.synchronize()
+            if binding is not None:
+                signals = self._check_progress(plans, ticket.base, initial_signals=binding.signal_values)
+                report["published_signals"] = [[*key, value] for key, value in sorted(signals.items())]
             report["passed"] = report["completed"] = True
         except BaseException as error:
             report["errors"].append(f"{type(error).__name__}: {error}")
             raise
         finally:
             report["phases_count"] = len(report["phases"])
-            _json(directory / "manifest.json", report)
+            if directory is not None:
+                _json(directory / "manifest.json", report)
         return report
 
 
@@ -508,5 +533,9 @@ def complete_native(run):
     if not run.finished:
         raise RuntimeError("native complete requires a successfully finished run")
     run.session.mark_complete(run.ticket)
+    binding = getattr(run.ticket, "binding", None)
+    if binding is not None:
+        # Commit the host's signal history only after every rank has completed.
+        binding.signal_values.update({tuple(entry[:3]): entry[3] for entry in run.result["published_signals"]})
     run.completed = True
     return run.result

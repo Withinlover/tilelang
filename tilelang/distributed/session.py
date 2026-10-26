@@ -209,7 +209,7 @@ def channel(ctx, *, key, peers=None):
         return result
 
 
-def _validate_manifest(ctx, manifest, ch):
+def _validate_manifest(ctx, manifest, ch, objects=None):
     if manifest.get("schema_version") != 1 or manifest.get("profile") != ctx.profile:
         raise ValueError("kernel distributed ABI/profile does not match the session")
     groups = manifest.get("groups", [])
@@ -218,14 +218,17 @@ def _validate_manifest(ctx, manifest, ch):
     channels = manifest.get("channels", [])
     if len(channels) != 1 or channels[0].get("name") != ch.key or channels[0].get("group") != groups[0]["name"]:
         raise ValueError("kernel channel binding does not match the prepared channel")
-    objects = manifest.get("objects", [])
-    if not objects or len({obj["key"] for obj in objects}) != len(objects):
+    specs = manifest.get("objects", [])
+    if not specs or len({obj["key"] for obj in specs}) != len(specs):
         raise ValueError("kernel manifest must contain unique symmetric object keys")
-    expected_keys = [obj["key"] for obj in objects]
-    if [key for key in ctx.objects if key in expected_keys] != expected_keys:
+    bound = ctx.objects if objects is None else objects
+    expected_keys = [obj["key"] for obj in specs]
+    if [key for key in bound if key in expected_keys] != expected_keys:
         raise ValueError("symmetric allocation order does not match the kernel manifest")
-    for spec in objects:
-        obj = ctx.objects.get(spec["key"])
+    if objects is not None and set(bound) != set(expected_keys):
+        raise ValueError("symmetric bindings must match exactly the kernel manifest")
+    for spec in specs:
+        obj = bound.get(spec["key"])
         if obj is None:
             raise ValueError(f"missing symmetric allocation {spec['key']!r}")
         expected = {
@@ -243,9 +246,11 @@ def _validate_manifest(ctx, manifest, ch):
                 raise ValueError(f"symmetric object {obj.key!r} has mismatched {key}: manifest={spec.get(key)!r}, allocation={value!r}")
 
 
-def prepare_launch(ctx, kernel, *, channel, epochs, protocol, parameters=None):
+def prepare_launch(ctx, kernel, *, channel, epochs, protocol, parameters=None, binding=None):
     if ctx.profile == NATIVE_PROFILE:
-        return ctx.prepare(kernel, channel=channel, epochs=epochs, protocol=protocol, parameters=parameters)
+        return ctx.prepare(kernel, channel=channel, epochs=epochs, protocol=protocol, parameters=parameters, binding=binding)
+    if binding is not None:
+        raise UnsupportedProfileError("program bindings currently require a native session")
     with ctx._lock:
         if ctx.state == "LOCAL_DONE":
             # One synchronous coordinator has already completed every logical rank.
