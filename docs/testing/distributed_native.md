@@ -237,3 +237,74 @@ phase 或请求污染却未实际污染都不算成功负例。退出码 2 表�
 检查器可拒绝已展开有限计划中的确定性等待死锁、非法区域、错 epoch 和元信息不一致，
 不能静态证明所有跨 rank 协议都没有数据竞争。此版本不输出融合加速比或通信带宽认证。
 双卡精度、内存可见性和进度的最终结论，以本节实机结果为准。
+
+## 7. 设备初始化与 bridge 加载排障
+
+若运行在 `torch.npu.set_device()` 阶段失败，例如错误码 `507033` 并伴随 `TsdOpen failed`，
+先使用独立入口 [diagnose_native_runtime.py](../../examples/distributed/diagnose_native_runtime.py)
+比较普通 PyTorch 单卡计算与 bridge 加载顺序。`507033` 表示设备启动失败；同一堆栈后续出现的
+“无有效 context”不足以证明程序漏调 `set_device`，也不能仅凭这条堆栈断言是环境或 bridge 的问题。
+此时原生 Session 尚未完成设备绑定，不能据此判断 SHMEM 通信或 GEMM 是否正确。
+
+在发生故障的同一账号、容器、终端和 Python 环境中，从仓库根目录运行：
+
+```bash
+python examples/distributed/diagnose_native_runtime.py \
+  --devices 0 1 --shmem-root "$SHMEM_ROOT" \
+  --shmem-library "$SHMEM_LIBRARY" \
+  --timeout 180 --output-dir output/distributed/diagnostics
+```
+
+`--devices` 使用当前进程可见的设备索引；可只传一张卡。`--shmem-library` 可省略，库选择规则与
+原生入口相同。保持发生故障时的运行库配置，脚本不会修改 `LD_LIBRARY_PATH` 或重置设备。
+每个设备的每种模式都会在全新的子进程中执行，各探针串行运行，默认包含以下三组：
+
+| 模式 | 执行顺序 | 用途 |
+| --- | --- | --- |
+| `plain` | 只导入 `torch`/`torch_npu`，绑定设备，执行微型加法并校验结果 | 检查普通单卡计算能否启动，不导入 TileLang |
+| `bridge-first` | 导入 TileLang、构造 `ShmemBridge`，再绑定设备并校验加法 | 复现原生入口在设备绑定前加载 bridge 的顺序 |
+| `torch-first` | 先绑定设备并校验加法，再加载 bridge，再校验加法 | 比较设备初始化先于 bridge 加载的情况 |
+
+两种 bridge 模式在加法校验之后还会执行 `bridge_device_identity` 阶段：再次调用
+`torch.npu.set_device()`，通过 bridge 查询 SoC 并确认其为 Ascend 950，再查询物理设备映射。
+该阶段单独记录，失败不能等同于 bridge 加载失败或加法计算失败。
+
+这些探针不创建分布式 Session，不执行 SHMEM 初始化或双卡通信。TileLang 导入期间可能间接
+导入 PyTorch 或 `torch_npu`，因此 `bridge-first` 比较的是设备初始化与 bridge 加载的先后，
+不保证 bridge 先于所有 Python 模块导入。报告记录执行阶段和已加载的相关运行库路径。
+
+也可先只跑纯单卡基线；这一模式不要求构建 TileLang 或配置 SHMEM：
+
+```bash
+python examples/distributed/diagnose_native_runtime.py \
+  --devices 0 1 --modes plain --timeout 180 \
+  --output-dir output/distributed/diagnostics_plain
+```
+
+`--timeout` 是每个探针的期限，包含导入、bridge 构建和设备操作。某个探针失败后仍继续其余探针；
+超时会终止该探针的进程组，避免编译子进程继续运行。只要有探针失败或超时，脚本最终返回非零。
+这种进程清理不保证已提交的设备请求被成功取消。
+
+每次运行会在 `--output-dir` 下新建 `run-*` 子目录，不覆盖之前的结果。终端会打印本次目录，其中包括：
+
+- `report.json`：完整报告，含执行阶段、版本、选定环境变量、运行库路径与错误信息。
+- `summary.json`：用于人工审查和脱敏的摘要，不含完整路径、环境变量或 traceback。
+- 每个探针的 `.log` 和 `.json`：保留独立进程的原始输出与阶段记录，便于本地定位首次失败。
+
+原始报告和日志留在保密环境。需要反馈时，先人工检查 `summary.json`，再按环境要求脱敏；
+摘要仍可能包含版本或设备相关信息，不应未经审查直接对外发送。脚本不会自动上传结果。
+
+按同一设备的三组结果判断下一步：
+
+| 结果 | 下一步 |
+| --- | --- |
+| `plain` 在导入、设备绑定或加法阶段失败 | 先检查对应 Python/`torch_npu`、驱动、固件、CANN、设备可见性及容器配置；以该进程 Ascend 日志中的首次错误为依据 |
+| `plain` 通过，bridge 模式在构建或加载阶段失败 | 检查固定 SHMEM revision、头文件、编译器、库文件及其动态链接依赖；此结果还未比较到设备初始化 |
+| `plain` 与 `torch-first` 通过，只有 `bridge-first` 在设备绑定或计算阶段失败 | 优先比较各阶段实际加载的运行库及路径，进一步调查加载顺序；这只是定位线索，不是根因证明 |
+| `plain` 通过，两种 bridge 模式均在设备绑定或计算阶段失败 | 根据首次失败阶段及库路径继续定位 bridge 与运行环境的相互影响 |
+| 加法已通过，失败阶段为 `bridge_device_identity` | 本地查看错误详情，区分再次绑定设备、Ascend 950 型号检查或物理设备映射查询失败；不能归为加法精度失败 |
+| 三组均通过 | 单卡基础与两种加载顺序检查通过，再回到第 4 节执行真实双卡测试；这不证明 SHMEM 或双卡 GEMM 已通过 |
+
+不要把 SDK 的 `devlib` 链接桩库或 Simulator 运行库用于真实设备进程。仓库构建选项
+`TILELANG_USE_ASCEND_STUBS` 对应的是延迟加载真实 ACL 的转发层，不能仅凭该选项名称认定
+正在使用 Simulator；排障时以报告中实际加载的库为准。

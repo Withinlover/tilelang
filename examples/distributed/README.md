@@ -27,3 +27,19 @@ python -m examples.distributed.run_native_distributed \
 ```
 
 本机已完成原生源码生成、SDK 编译和 Host ABI 检查，尚未执行真实双卡。实机应按原生指南准备固定 SHMEM/CANN 组合，依次运行 put、get、GEMM、多次 launch 和污染负例；不能把 `--mode build` 的成功当作设备精度通过。
+
+若在设备初始化阶段失败，使用独立脚本 [diagnose_native_runtime.py](diagnose_native_runtime.py)
+比较纯 `torch_npu` 单卡计算与 bridge 在设备初始化前、后加载的结果。每张卡的每种模式都使用
+全新进程，串行执行；两种 bridge 模式还在加法通过后检查 Ascend 950 型号及物理设备映射，
+以 `bridge_device_identity` 单独记录再次设备绑定和身份查询的结果。脚本不执行 SHMEM 初始化或双卡通信：
+
+```bash
+python examples/distributed/diagnose_native_runtime.py \
+  --devices 0 1 --shmem-root "$SHMEM_ROOT" \
+  --shmem-library "$SHMEM_LIBRARY" \
+  --timeout 180 --output-dir output/distributed/diagnostics
+```
+
+只检查纯单卡时，传 `--modes plain`，不需要 SHMEM 或已构建的 TileLang。
+完整报告与原始日志留在本地；`summary.json` 经人工审查、脱敏后可用于反馈。
+参数、结果判读及边界见 [原生指南第 7 节](../../docs/testing/distributed_native.md#7-设备初始化与-bridge-加载排障)。
