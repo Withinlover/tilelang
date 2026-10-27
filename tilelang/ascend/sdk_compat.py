@@ -16,6 +16,10 @@ def adapt_source(source, profile, arch):
         from .distributed.segments import adapt_cann91_gemm64
 
         return adapt_cann91_gemm64(source)
+    if profile == "cann-9.1-packed-gemm":
+        from .distributed.segments import adapt_cann91_packed_gemm
+
+        return adapt_cann91_packed_gemm(source)
     if profile == "cann-9.1-shmem":
         from .distributed.transport import adapt_cann91_shmem
 

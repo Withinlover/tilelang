@@ -188,8 +188,7 @@ class NativeCompiledProgram:
         macro = shmem_include_flags(shmem_root)[-1]
         return macro.removeprefix("-DTL_SHMEM_HEADER_DIGEST_").removesuffix("=1")
 
-    def plan(self, *, scalars=None, epoch_base=0, epoch_end=None, initial_signals=None):
-        """Validate every rank and phase before any device request is submitted."""
+    def _launch_values(self, scalars, epoch_base):
         self._validate_source_identity()
         if isinstance(epoch_base, bool) or not isinstance(epoch_base, int) or not 0 <= epoch_base < MAX_EPOCH:
             fail("epoch base must be a nonnegative int32 below the final signal epoch")
@@ -197,6 +196,17 @@ class NativeCompiledProgram:
         if "epoch0" in values and values["epoch0"] != epoch_base:
             fail("epoch0 must equal the prepared native epoch base")
         values.setdefault("epoch0", epoch_base)
+        return values
+
+    def _launch_plan(self, **kwargs):
+        return self.plan(**kwargs)
+
+    def _launch_progress(self, plans, epoch_base, *, initial_signals=None):
+        return self._check_progress(plans, epoch_base, initial_signals=initial_signals)
+
+    def plan(self, *, scalars=None, epoch_base=0, epoch_end=None, initial_signals=None):
+        """Validate every rank and phase before any device request is submitted."""
+        values = self._launch_values(scalars, epoch_base)
         plans = self._expand_plans(values)
         published = [
             instruction[5] if instruction[0] == "put_signal" else instruction[2]
@@ -228,6 +238,8 @@ class NativeCompiledProgram:
                 elif kind == "local_copy":
                     refs.extend(args)
                 elif kind in ("gemm", "vector"):
+                    if self.profile == NATIVE_PROFILE and kind == "gemm" and len(args[2]) == 1 and isinstance(args[2][0], tvm.tirx.For):
+                        fail("tiled GEMM device loops require fused P0-B; the phased path supports fixed GEMM64 only")
                     refs.extend([*args[0], args[1]])
                 for ref in refs:
                     self._validate_ref(ref)
@@ -434,9 +446,11 @@ class NativeCompiledProgram:
         self.build(shmem_root=shmem_root, plans=plans, output_dir=output_dir)
         return None
 
-    def run(self, *, session, ticket, buffers=None, scalars=None, **kwargs):
+    def run(self, *, session, ticket, buffers=None, scalars=None, measure_device=False, **kwargs):
         started = time.perf_counter()
         timings = {}
+        if not isinstance(measure_device, bool):
+            fail("measure_device must be a bool")
         if kwargs:
             fail(f"unsupported native launch options: {sorted(kwargs)}")
         if self.header_fingerprint is None:
@@ -452,7 +466,7 @@ class NativeCompiledProgram:
             fail("native buffer bindings must match exactly the compiled symmetric objects")
         timings["validate_bindings"] = time.perf_counter() - started
         stamp = time.perf_counter()
-        plans = self.plan(
+        plans = self._launch_plan(
             scalars=scalars,
             epoch_base=ticket.base,
             epoch_end=ticket.end,
@@ -478,6 +492,7 @@ class NativeCompiledProgram:
                 "manifest_digest": self._manifest_digest,
                 "transport_abi": session.abi_fingerprint,
                 "plans": plan_json,
+                "measure_device": measure_device,
             }
         )
         timings["plan_preflight"] = time.perf_counter() - stamp
@@ -531,14 +546,21 @@ class NativeCompiledProgram:
         timings["report_finalize"] = time.perf_counter() - stamp
         stamp = time.perf_counter()
         try:
+            if measure_device:
+                session.begin_device_timing()
             self._execute(plans, session, bound, report)
+            if measure_device:
+                session.end_device_timing()
             timings["bind_and_submit"] = time.perf_counter() - stamp
             stamp = time.perf_counter()
             session.synchronize()
             timings["stream_sync"] = time.perf_counter() - stamp
             stamp = time.perf_counter()
+            if measure_device:
+                report["device_stream_seconds"] = session.device_elapsed_seconds()
+                report["device_timing_basis"] = "acl_event_stream_interval_including_submission_gaps"
             if binding is not None:
-                signals = self._check_progress(plans, ticket.base, initial_signals=binding.signal_values)
+                signals = self._launch_progress(plans, ticket.base, initial_signals=binding.signal_values)
                 report["published_signals"] = [[*key, value] for key, value in sorted(signals.items())]
             report["passed"] = report["completed"] = True
         except BaseException as error:

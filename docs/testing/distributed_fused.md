@@ -11,7 +11,7 @@
 | --- | --- | --- |
 | `phased` | `ascend950_shmem_mte_phased_v1` | 保留的分段 SHMEM 通信、独立本地计算基线 |
 | `p0a` | `ascend950_shmem_mte_p0a_v1` | 每 rank 一个 pure AIV kernel；put/get、GM↔UB、受支持的 FP32 SIMD 向量操作、显式完成/可见性和退出 drain |
-| `p0b` | `ascend950_shmem_mte_p0b_v1` | 一个 mixed block、AIV0 唯一通信发起者；同 kernel 中手写 READY/ACK 的 AllGather＋BF16 64×64 GEMM、FP32 输出 |
+| `p0b` | `ascend950_shmem_mte_p0b_v1` | 一个 mixed block、AIV0 唯一通信发起者；同 kernel 中手写 READY/ACK 的 AllGather＋BF16 GEMM、FP32 输出；64×64 tile 与下文受限 packed M/N/K 循环 |
 
 共同限制：单机双 rank、一个静态组/通道、一个活动 Session/launch；固定 `dav-3510`、AscendC、SHMEM MTE。
 数据端点显式分配为对称 GM，通信偏移和长度满足 32 字节对齐，信号 int32、每个单元隔离 64 字节。
@@ -29,6 +29,10 @@ P0-B 由编译器对受支持的静态轮次计划建立本地任务依赖；每
 该源码对象不可变时才使用 identity 路径，否则保留序列化校验。性能入口要求各次 launch
 及两个 rank 报告同一方式，避免把不同校验开销混为同一结果。
 显式再次 build、新 scalar specialization 或缓存逐出后的重建仍做完整编译输入检查。
+完整 build 后，若 epoch 平移证明覆盖当前区间，artifact 可复用静态计算/区域契约，
+逐次检查真实 epoch、信号历史和进度，跨 rank 比较契约及 artifact 身份，不再遍历和
+序列化计算 IR。证明不足或超出区间时回退完整计划检查；READY/ACK、DMA 生命周期、
+资源独占和完整区域检查在封存前完成。公开 `plan()` 与 strict 的完整检查保持不变。
 磁盘文件的后续编辑不会改变已经加载的 artifact；需要应用新内容时重新构建，需要逐次
 检查磁盘变动时使用 strict。该区别必须随结果记录，不能把 Host 校验成本变化称为设备优化。
 
@@ -41,6 +45,8 @@ P0-A 向量例子在 [example_fused_exchange.py](../../examples/distributed/exam
 独立 oracle 用未修改的原始 peer 输入乘二。P0-B 复用
 [example_allgather_gemm.py](../../examples/distributed/example_allgather_gemm.py) 的源 TD 协议，
 oracle 从原始全局 BF16 bits 解码后做 CPU FP64 矩阵乘法。
+真正的 1024×1024×1024 dense GEMM 使用独立的[大矩阵 shape sweep](#真正的大矩阵-shape-sweep)，
+原三轮小 tile 基线和完整协议验收矩阵保持不变。
 
 ## 更新、依赖与构建
 
@@ -365,3 +371,96 @@ kernel。此规则只复用资源编号，保留原同步动作和依赖。
 scratch 身份；指针展平及存储合并后再次核对任务顺序、epoch、effect 参数数量，以及
 scratch 的实际物理字节范围。其他本地指针必须可证明与该范围不相交。回归包含最终 IR
 中的本地指针被改入 scratch 的负例。上述检查保护本版编译契约，不替代硬件可见性认证。
+
+## 真正的大矩阵 shape sweep
+
+原有三轮 64×64 基线保持不变。独立入口 `examples.distributed.benchmark_p0_shapes`
+用于更大通信和计算工作量：主用例每 rank 的 `M=N=K=1024`，每 rank 持有一个
+1024×1024 BF16 A 和相同的 BF16 B，AllGather 后输出 2048×1024 FP32 矩阵。
+K=1024 是设备上的 16 次真实累加，不以 16 个独立 K=64 问题或增加 rounds 替代。
+
+支持 M、N、K 各为 64 的整数倍，范围 64–1024；默认先跑 128、256，再跑 1024。
+内部布局为 `A[Mt,Kt,64,64]`、`B[Nt,Kt,64,64]`（末两维是 K,N），
+`Output[owner,Mt,Nt,64,64]`。P0-B 的 `td.gemm` 有限区域保留设备 M/N/K 循环，
+不把 1024 的计算展开成上千条 Python/协议指令。这是显式、受检查的固定布局契约；
+其他 dtype、残块、任意 stride、任意循环体不在此范围内。
+
+三个模式都传输每 rank 一个完整的 M×K BF16 A packet，执行相同的 dense GEMM。
+HCCL 调用一次整 A AllGather，再调用一次普通 TileLang grid GEMM；P0-A 调用一次
+pure AIV 整 A 交换，再调用**同一个** grid GEMM。两者每次只有一个本地计算 kernel
+提交，grid 为 `2×Mt×Nt`，不会通过每 tile 的 Python launch 人为抬高基线开销。
+P0-B 仍只有一个 mixed block，通信由 AIV0 发起，Cube 上执行两个有界计算区域。
+1024 时普通本地 GEMM 有 512 个 block，而 P0-B 是一个 block；报告明确披露这种
+资源差异，不预设融合路径会快于多核基线。
+
+P0-B 源协议为 put、local GEMM、READY/acquire、remote GEMM、ACK、drain。
+P0-A 的 ACK 不表示后续 host 发起的本地 GEMM 已结束；其接收区通过 host 协议保持：
+`D.complete` 后读取 Send/Recv，本地 GEMM 完成并同步后，才能进入下一次双 rank
+prepare/握手，随后才允许下一次 put。不能去掉末尾同步或把下一次 prepare 提前。
+
+使用本页前面的环境、构建和 SHMEM 配置后，按阶段运行：
+
+```bash
+# CPU 的布局、真实 K 累加参考、错误检出、计时/报告回归；不访问设备。
+python -m examples.distributed.benchmark_p0_shapes \
+  --stages cpu --output-dir output/distributed/p0-shapes
+
+# 真 SDK 编译三种规模/三个模式；每项独立超时，失败继续记录其他项。
+python -m examples.distributed.benchmark_p0_shapes \
+  --stages compile --shapes 128,256,1024 --modes hccl,p0a,p0b \
+  --sdk-profile cann-9.1 --execution-policy artifact \
+  --shmem-root "$SHMEM_ROOT" --shmem-library "$SHMEM_LIBRARY" \
+  --timeout 900 --output-dir output/distributed/p0-shapes
+
+# 真实双卡：每个模式预热 3 次、测量 20 次；全部迭代都检查数值。
+python -m examples.distributed.benchmark_p0_shapes \
+  --stages device --shapes 128,256,1024 --modes hccl,p0a,p0b \
+  --devices 0 1 --iterations 20 --warmup 3 --measure-device \
+  --sdk-profile cann-9.1 --execution-policy artifact \
+  --shmem-root "$SHMEM_ROOT" --shmem-library "$SHMEM_LIBRARY" \
+  --timeout 900 --operation-timeout 180 --output-dir output/distributed/p0-shapes
+
+# 单独重跑 1024 的 P0-B；strict 可与 artifact 对照 host 校验成本。
+python -m examples.distributed.benchmark_p0_shapes \
+  --stages device --shapes 1024 --modes p0b --execution-policy strict \
+  --devices 0 1 --iterations 20 --warmup 3 --measure-device \
+  --shmem-root "$SHMEM_ROOT" --shmem-library "$SHMEM_LIBRARY" \
+  --timeout 900 --output-dir output/distributed/p0-shapes
+```
+
+也可使用 `--shapes 64x128x256,1024` 选择非方形前置用例。规模超过契约、SDK 编译错误、
+缺设备、超时或异常退出均记为失败；编译通过没有 `device_executed`，也没有设备通过含义。
+默认只执行 compile；不会默认发起真实设备测试。
+本节 `cpu` 只运行新 shape benchmark 的回归；完整 CPU/设备协议矩阵仍使用前文的
+`run_p0_validation --stages cpu` 和 `--stages device`，不能由这些 shape 用例替代。
+
+每次创建新的 `output/distributed/p0-shapes/run_*/`。顶层 `report.md` 和 `summary.json`
+只含有界汇总，体积随选定 shape/mode 数量变化，不随 iterations 增长。
+汇总包括 commit、SHMEM revision、SDK profile 和包版本；未找到的信息为 null。
+每项的 `compile|device/<MxNxK>/<mode>/` 保存完整 `detail.json`、`rank0.json`/`rank1.json`、
+torchrun 各 rank stdout/stderr、进程退出/超时记录和独立冷缓存。完整命令、绝对路径、
+原始错误只留本地明细。源码或资源限制导致的编译失败不会被当成 skip 或设备成功。
+
+host execution 包括通信/计算提交、原有动态协议校验和必要同步；E2E 另外包括 dense
+输入打包、本 rank A/B 暂存、ticket 准备、输出 readback 和解包，预分配设备存储仍会
+产生 host 临时对象。每次的独立 FP64 dense oracle 使用原始 BF16 输入，位于计时外，
+检查所有输出，容差为 `atol=2e-4, rtol=2e-5`。首次构建/缓存加载、首次 execution/E2E、
+稳态两 rank 逐次最大值的 median/p95 均保留；不同阶段的 rank 最大值/中位数不能相加。
+
+`--measure-device` 额外记录实际 stream 的 event interval。Session 预分配 ACL events，
+在其 SHMEM stream 上围绕 native execute 记录；HCCL/普通 GEMM 在实际当前 Torch stream
+记录。它们可能包含 host 提交造成的 stream 空闲，不应称为纯 kernel latency。
+P0-A 的通信和本地 GEMM 位于不同 stream，分别列为 `communication`、`local_gemm`，
+不相加宣称关键路径；HCCL 为 `collective_and_local_gemm`，P0-B 为 `fused`。
+HCCL 另在 AllGather 提交后记录中间 event，分别列出 `collective` 与 `local_gemm`；
+配对各 rank 的最大值再取中位数后，这两个统计值同样不能相加。
+未请求或没有数据时字段为 null。event 计时不替代原 host execution/E2E，也不证明重叠。
+P0-B 的一个 fused interval 不能拆分实际通信和计算占比；确认两者重叠仍需 profiler
+或进一步的单 block 计算对照，不能仅凭更大的 shape 推断已实现有效重叠。
+报告同时列出实际 `source_validation` 与 `launch_validation`（`static_contract` 或
+`full_plan`），用于识别 host 校验路径；这些字段在两 rank 和全部迭代中必须一致。
+
+吞吐按每 rank `4×M×N×K` useful FLOPs 和 `2×M×K` logical peer bytes 分别除以完整
+execution/E2E 时间报告；后者不是物理链路带宽。性能结果只证明本次 workload 的数值，
+不替代完整 put/get、slot 复用、延迟、负例设备验收。回传经检查的 `report.md` 和
+`summary.json` 即可；保留原始各 rank 样本供需要时脱敏诊断。

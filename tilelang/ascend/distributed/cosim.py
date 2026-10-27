@@ -210,6 +210,8 @@ class CompiledProgram:
         # protocol simulator's own identities at its execution boundary.
         result = []
         for instruction in plan:
+            if instruction[0] == "gemm" and len(instruction[3]) == 1 and isinstance(instruction[3][0], tvm.tirx.For):
+                fail("packed GEMM device loops require the P0-B profile; protocol/rank-segments currently support GEMM64 only")
             result.append(
                 tuple(
                     self.model.SignalRef(item.rank, item.key, item.index) if isinstance(item, SignalRef) else item for item in instruction

@@ -21,6 +21,7 @@ from tvm import tirx
 from tilelang.analysis.distributed_checker import fail, op_name, tile_region
 from tilelang.distributed.abi import P0A_PROFILE, P0B_PROFILE, manifest_digest
 from .native import NativeCompiledProgram, _digest, _json, describe_instruction
+from .artifact_plan import StaticLaunch, make_static_contract
 from .plan import plan_program
 from .transport import SCRATCH_BYTES, shmem_include_flags
 
@@ -394,6 +395,7 @@ class _FusedArtifact:
     build_root: str
     configuration: tuple
     kernels: tuple
+    contract: object = None
 
 
 class FusedCompiledProgram(NativeCompiledProgram):
@@ -470,6 +472,8 @@ class FusedCompiledProgram(NativeCompiledProgram):
         return _clone_containers(self._description_cache[key])
 
     def _describe_plans(self, plans):
+        if isinstance(plans, StaticLaunch):
+            return plans.metadata()
         return {str(rank): [self._description(item) for item in plan] for rank, plan in plans.items()}
 
     def _scalar_key(self, values):
@@ -509,7 +513,15 @@ class FusedCompiledProgram(NativeCompiledProgram):
             if any(proof is None for proof in proofs)
             else (max(proof.min_base for proof in proofs), min(proof.max_base for proof in proofs))
         )
-        entry = {"plans": reference, "descriptions": descriptions, "funcs": None, "keys": None, "proof": interval, "artifact": None}
+        entry = {
+            "plans": reference,
+            "descriptions": descriptions,
+            "funcs": None,
+            "keys": None,
+            "proof": interval,
+            "artifact": None,
+            "scalars": key,
+        }
         # A scalar specialization owns its TIR and kernels. Keep this working set
         # bounded; an evicted specialization is rebuilt on its next use.
         if len(self._reference_cache) == 4:
@@ -542,6 +554,29 @@ class FusedCompiledProgram(NativeCompiledProgram):
         else:
             self._expanded_cache.move_to_end(key)
         return _clone_containers(self._expanded_cache[key])
+
+    def _launch_plan(self, *, scalars=None, epoch_base=0, epoch_end=None, initial_signals=None):
+        if self.execution_policy == "artifact":
+            values = self._launch_values(scalars, epoch_base)
+            key = tuple((name, value) for name, value in self._scalar_key(values) if name != "epoch0")
+            entry = self._reference_cache.get(key)
+            artifact = None if entry is None else entry["artifact"]
+            contract = None if artifact is None else artifact.contract
+            if (
+                contract is not None
+                and contract.epoch_bounds[0] <= epoch_base <= contract.epoch_bounds[1]
+                and self._check_artifact_handles(artifact)
+            ):
+                signals, end = contract.signal_plans(epoch_base, epoch_end)
+                self._check_progress(signals, epoch_base, initial_signals=initial_signals)
+                self._reference_cache.move_to_end(key)
+                return StaticLaunch(contract, artifact, epoch_base, end, signals)
+        return self.plan(scalars=scalars, epoch_base=epoch_base, epoch_end=epoch_end, initial_signals=initial_signals)
+
+    def _launch_progress(self, plans, epoch_base, *, initial_signals=None):
+        if isinstance(plans, StaticLaunch):
+            return self._check_progress(plans.signals, epoch_base, initial_signals=initial_signals)
+        return super()._launch_progress(plans, epoch_base, initial_signals=initial_signals)
 
     def plan(self, *, scalars=None, epoch_base=0, **kwargs):
         if self.execution_policy == "strict":
@@ -660,15 +695,20 @@ class FusedCompiledProgram(NativeCompiledProgram):
             self._validate_source_identity(strict=True)
             if self._header_fingerprint(shmem_root) != fingerprint:
                 fail("SHMEM device headers changed during artifact build")
+            contract = make_static_contract(
+                entry["plans"], proof=entry["proof"], scalars=entry["scalars"], descriptions=entry["descriptions"]
+            )
             identity = {
                 "manifest": self._manifest_digest,
                 "rank_kernel_keys": [list(self._rank_keys[r]) for r in (0, 1)],
+                "static_contract": None if contract is None else contract.identity,
             }
             pending_artifact = _FusedArtifact(
                 manifest_digest(identity),
                 str(Path(shmem_root).expanduser().resolve()),
                 self._artifact_configuration(),
                 loaded,
+                contract,
             )
         self.build_report = {
             "profile": self.profile,
@@ -732,6 +772,13 @@ class FusedCompiledProgram(NativeCompiledProgram):
     def _prepare_executable(self, *, shmem_root, plans, output_dir=None):
         if self.execution_policy == "artifact":
             self._validate_source_identity()
+            if isinstance(plans, StaticLaunch):
+                artifact = plans.artifact
+                if artifact.contract is not plans.contract or not self._check_artifact_handles(artifact):
+                    fail("static launch contract no longer has its sealed executable")
+                if str(shmem_root) != artifact.build_root:
+                    fail("compiled artifact SHMEM root does not match the Session")
+                return artifact.artifact_id
             if _container_key(plans) != self._current_plan_token:
                 fail("artifact execution requires this program's validated current plan")
             artifact = self._active_reference["artifact"]
@@ -757,13 +804,18 @@ class FusedCompiledProgram(NativeCompiledProgram):
             )
         values.append(report["epoch_base"])
         if self.execution_policy == "artifact":
-            artifact = self._active_reference["artifact"]
+            artifact = plans.artifact if isinstance(plans, StaticLaunch) else self._active_reference["artifact"]
             entry = next(loaded.entry for loaded in artifact.kernels if loaded.rank == session.rank)
         else:
             entry = self._kernels[self._rank_keys[session.rank]]
         session.launch_kernel(entry, *values)
         report.update(device_executed=True, kernel_executed=True, physical_kernel_count=1)
-        report["phases"] = [{"index": index, "op": item[0]} for index, item in enumerate(plans[session.rank])]
+        report["launch_validation"] = "static_contract" if isinstance(plans, StaticLaunch) else "full_plan"
+        report["phases"] = (
+            plans.contract.phases[session.rank]
+            if isinstance(plans, StaticLaunch)
+            else [{"index": index, "op": item[0]} for index, item in enumerate(plans[session.rank])]
+        )
 
 
 def adapt_cann91_fused(source):

@@ -129,6 +129,10 @@ def extract_segment(statements, alloc_buffers, input_regions, output_region, *, 
     with a 64x64 trailing region. This matches cannsim-helper's current GEMM ABI.
     Runtime scalar substitutions must already have been applied by the caller.
     """
+    if len(statements) == 1 and isinstance(statements[0], tirx.For):
+        from .tiled_gemm import extract_tiled_segment
+
+        return extract_tiled_segment(statements[0], alloc_buffers, input_regions, output_region, annotations)
     if len(input_regions) != 2 or not statements:
         raise SegmentCompileError("GEMM segments need two inputs, one output, and a nonempty body")
     regions = [*input_regions, output_region]
@@ -251,6 +255,22 @@ def extract_segment(statements, alloc_buffers, input_regions, output_region, *, 
 
 
 def adapt_cann91_gemm64(source):
+    return _adapt_cann91_cube(source, input_copies=2, profile="cann-9.1-gemm64")
+
+
+def adapt_cann91_packed_gemm(source):
+    """Translate the same fixed tile ISA with retained packed GEMM loops.
+
+    The grid baseline may choose between two A allocations before the common B
+    copy. Both arms remain in the generated source, so it has three copy sites.
+    """
+    copies = source.count("asc_copy_gm2l1_nd2nz(")
+    if copies not in (2, 3) or source.count("asc_mmad(") != 1 or source.count("asc_copy_l0c2gm(") != 1:
+        raise SegmentCompileError("cann-9.1-packed-gemm requires one fixed GEMM64 loop body and two or three input copy sites")
+    return _adapt_cann91_cube(source, input_copies=copies, profile="cann-9.1-packed-gemm")
+
+
+def _adapt_cann91_cube(source, *, input_copies, profile):
     """Translate only the audited 64x64 Cube GEMM SDK surface.
 
     Fail closed on an unfamiliar generated body. Packing of MTE2_NZ_PARA and
@@ -259,13 +279,17 @@ def adapt_cann91_gemm64(source):
     """
     includes = "#include <tl_templates/ascend/common.h>\n#include <tl_templates/ascend/debug.h>\n"
     if source.count(includes) != 1 or "__global__ __cube__" not in source:
-        raise SegmentCompileError("cann-9.1-gemm64 requires the standard pure Cube source preamble")
+        raise SegmentCompileError(f"{profile} requires the standard pure Cube source preamble")
     # This profile does not compile arbitrary SIMD/debug template contents,
     # which target newer SDK APIs even when unused by this fragment.
     result = source.replace(includes, "#include <c_api/asc_simd.h>\n")
     replacements = [
-        ("asc_set_gm2l1_nz_para(1, 1, static_cast<uint16_t>(64), 0)", "asc_set_gm2l1_nz_para((64ULL << 32) | (1ULL << 16) | 1ULL)", 2),
-        ("static_cast<asc_load_l2_cache_mode>(0)", "0", 2),
+        (
+            "asc_set_gm2l1_nz_para(1, 1, static_cast<uint16_t>(64), 0)",
+            "asc_set_gm2l1_nz_para((64ULL << 32) | (1ULL << 16) | 1ULL)",
+            input_copies,
+        ),
+        ("static_cast<asc_load_l2_cache_mode>(0)", "0", input_copies),
         ("asc_set_l0c_copy_nz_para(1, 0, 0)", "asc_set_l0c2gm_nz2nd(1, 0, 0)", 1),
         (
             "static_cast<asc_store_l2_cache_mode>(0), static_cast<asc_unit_flag_mode>(0), static_cast<asc_quant_mode>(0), static_cast<asc_relu_pre_mode>(0), 0, 1, 0, 0",
@@ -275,7 +299,7 @@ def adapt_cann91_gemm64(source):
     ]
     for old, new, expected in replacements:
         if result.count(old) != expected:
-            raise SegmentCompileError(f"cann-9.1-gemm64 expected {expected} occurrences of {old!r}")
+            raise SegmentCompileError(f"{profile} expected {expected} occurrences of {old!r}")
         result = result.replace(old, new)
     allowed = {
         "asc_init",
@@ -291,7 +315,7 @@ def adapt_cann91_gemm64(source):
     }
     unknown = set(re.findall(r"\b(asc_\w+)\s*\(", result)) - allowed
     if unknown:
-        raise SegmentCompileError(f"cann-9.1-gemm64 does not translate these SDK operations: {sorted(unknown)}")
+        raise SegmentCompileError(f"{profile} does not translate these SDK operations: {sorted(unknown)}")
     return result
 
 
@@ -304,6 +328,8 @@ def compile_segment(statements, alloc_buffers, input_regions, output_region, out
     """
     if profile not in {"native", "cann-9.1-gemm64"}:
         raise SegmentCompileError(f"Unknown compilation profile {profile!r}")
+    if len(statements) == 1 and isinstance(statements[0], tirx.For):
+        raise SegmentCompileError("packed GEMM device loops require the P0-B profile; the simulator segment ABI supports GEMM64 only")
     out = Path(output_dir).resolve()
     out.mkdir(parents=True, exist_ok=True)
     func = extract_segment(statements, alloc_buffers, input_regions, output_region, annotations=annotations)

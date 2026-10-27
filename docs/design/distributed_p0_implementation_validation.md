@@ -506,3 +506,75 @@ strict 与本轮 artifact。每组 3 次 warmup、20 次测量，暂存、同步
 `artifact-tcp/`、`baseline-tcp-reverse/` 的各 rank 原始 Host 样本与 profiling。
 `profile_host.py`、`profile_pair.py` 保留隔离实验的复现命令参数和超时监督；这些本地
 产物不随 Git 提交，服务器性能仍使用正式统一入口。
+
+## 14. 真实大矩阵与稳态静态契约
+
+用户在 `0d3cbef3` 回传的 64×64 性能工作负载中，HCCL execution 中位数为
+0.212 ms，P0-A 为 2.403 ms，P0-B 为 2.671 ms；两条 P0 路径仍有约 100 ms 的
+p95。该报告仅覆盖性能工作负载，`device_acceptance=not_run`，不能认定完整设备
+验收通过，也不能把 host execution 当成纯 kernel 时间。本轮按用户要求优先增加
+每 rank M=N=K=1024，以观察真正增加通信和计算工作量后的行为。
+
+[大矩阵示例](../../examples/distributed/example_p0_shapes.py) 的两 rank 分别持有
+1024×1024 BF16 A，使用相同的 1024×1024 BF16 B。每 rank 向对端发送一次完整 A
+（2 MiB），各自输出 2048×1024 FP32；每 rank 有效计算量为 4,294,967,296 FLOPs。
+packed A/B 的末两维分别是 M/K、K/N；CPU FP64 oracle 直接使用原始 dense 输入，
+不使用接收区生成参考。打包、暂存、必要同步、回读和解包均计入 E2E。
+
+`td.gemm=1` 标记的显式有限区域保留 M/N/K 三层设备循环，K 维的累加器只在
+`k==0` 清零。每轴支持 1–16 个 64 tile，BF16 输入、FP32 输出；要求完整连续
+packed 区域、固定 copy/GEMM 结构和五个独立局部 allocation。容量越界、残块、
+其他 dtype/stride、漏读 K、错误清零或依赖 K 的局部指针均拒绝。1024 的每个 rank
+只有两个计算段，未在 host 展开 8192 次 tile GEMM。旧 phased 和 rank-segments
+helper 仍使用 GEMM64 ABI，对新 packed 段明确报 unsupported。
+
+P0-B 保持一个 mixed block、AIV0 单发起者。原 AutoSchedule/InsertSync 后的代码
+中，本地 Send GEMM 可先于远端 READY；首个 Recv MTE2 读取等待 acquire，ACK
+等待最后 row/col/K 的 Recv DMA 完成。无需删除同步或禁用 AutoSchedule。
+本轮没有修改编译器 C++ passes；新增的 C++ 仅为 host bridge 的 ACL event 适配。
+HCCL 和 P0-A 对照都使用同一个普通多 block TileLang GEMM，每次只提交一次；
+1024 时其 grid 为 512 block，P0-B 为一个 block。单 block 算力限制可能使 P0-B
+仍然更慢，不能为预设胜出而将基线拆成数千次 Python launch。
+
+artifact 在完整 plan、租约、ABI 和已加载 executable 验证后封存静态契约。稳态
+保留 source/manifest/config/scalar 身份、实际 epoch 区间、单写者信号历史/进度、
+Session buffer 所有权、跨 rank 握手和同步，避免重复扫描计算 IR。未知证明、
+证明范围外的 epoch、新 scalar 或缓存失效回退完整检查；公开 plan 和 strict
+语义保持不变。回归包含 500 组单写者信号计划的完整/投影进度差分及 warm 路径
+禁止再次调用计划展开、序列化和 build 的验证。这是 host 开销优化，不是设备加速认证。
+
+新增 [shape sweep 入口](../../examples/distributed/benchmark_p0_shapes.py) 分开执行
+CPU、真实 SDK compile、真实双卡 device，默认只 compile；支持按 shape/mode 单独
+重跑。沿用进程组超时监督并保存每 rank 日志、退出码、完整样本和独立数值检查。
+顶层 `report.md`/`summary.json` 的体积不随 iterations 增长。首次构建/执行、稳态
+host execution/E2E、实际校验策略和可选 event interval 分别报告。ACL event 在
+Session stream 上记录并在同步后读取，失败状态保留事件和在途资源；计时区间可
+包含 host 提交空隙，不能称为纯 kernel latency。两条 P0-A stream 的统计不相加。
+完整环境、构建与服务器命令见[融合验收指南](../testing/distributed_fused.md)。
+
+本轮本机证据：
+
+- 完整 CPU 回归：481 passed、0 skipped、6 deselected；独立 shape benchmark
+  回归 20 passed，包含真实 torchrun 参数解析、计时边界和失败数值检出。
+  模拟未构建 Ascend backend 的门控检查为 16 passed、4 skipped，保留纯 CPU 测试。
+- CANN 9.1 / Bisheng 真实 SDK：128、256、1024 × HCCL/P0-A/P0-B **9/9 通过**；
+  旧 phased/P0-A/P0-B 矩阵 **13/13 通过**，其中 20 份旧融合设备源码与 `0d3cbef3`
+  产物逐字相同。SDK host bridge 编译/链接及 DLPack ABI 探针另有 1 项通过；
+  探针不初始化 NPU，也未执行 ACL event 设备操作。
+- 新 packed 128³ pure-Cube 计算经真实 SDK 编译后，在隔离副本的 cannsim helper
+  中执行。全部 16,384 个输出与独立 FP64 参考比较：0 mismatch、0 nonfinite、
+  max abs error `6.139278411865234e-6`，rtol/atol 均 `1e-5`。两次 K 累加共 8 个
+  MMAD，AIC END 完整，252 个 instruction events 中 250 个有 detail；完整和隐藏
+  SET/WAIT 的 trace 均存在。MIX 修复状态为 `not_used`；这是单卡计算证据，
+  不是 mixed 通信、全尺寸 1024 数值或性能证据。
+- 实际经 torchrun 启动新 device 入口：本机没有 `torch_npu`，HCCL 两 rank
+  均退出 1，顶层退出 1、`device_executed=false`、状态 failed。证据在
+  `no-device-hccl/run_waacheha/`。未把依赖缺失或只编译通过计作设备成功。
+
+证据目录为 `output/distributed/shape_followup_20261027/`：`final-cpu/`、
+`sweep/run_p3fmwrd4/`、`legacy-sdk/run_kc4udue5/` 和
+`legacy-source-comparison.json`。128 计算仿真的复现入口为
+`output/distributed/packed_cannsim_128/reproduce.sh`，隔离 helper 及本次
+`run_packed_gemm128_s128_gnvpbh2b` 的 manifest、accuracy 和两份 trace 保存在该目录；
+原 helper 和主 checkout 的其他任务修改均未改动。产物不随 Git 提交。
+真实双卡正确性、可见性、进度、1024 完整数值和性能均继续**待实机验收**。

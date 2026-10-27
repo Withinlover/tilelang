@@ -73,6 +73,16 @@ int tl_shmem_stream_sync(void *stream, int timeout_ms) {
   return aclrtSynchronizeStreamWithTimeout(stream, timeout_ms);
 }
 int tl_shmem_stream_destroy(void *stream) { return aclrtDestroyStream(stream); }
+int tl_shmem_event_create(void **event) {
+  return aclrtCreateEventExWithFlag(event, ACL_EVENT_TIME_LINE);
+}
+int tl_shmem_event_record(void *event, void *stream) {
+  return aclrtRecordEvent(event, stream);
+}
+int tl_shmem_event_elapsed(float *milliseconds, void *start, void *end) {
+  return aclrtEventElapsedTime(milliseconds, start, end);
+}
+int tl_shmem_event_destroy(void *event) { return aclrtDestroyEvent(event); }
 int tl_shmem_set_device(int device) { return aclrtSetDevice(device); }
 int tl_shmem_physical_device(int device, int *physical_device) {
   return aclrtGetPhyDevIdByUserDevId(device, physical_device);

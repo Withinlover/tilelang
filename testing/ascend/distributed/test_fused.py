@@ -441,6 +441,9 @@ def test_artifact_warm_launch_uses_loaded_kernels_without_build_inputs(monkeypat
 
     with monkeypatch.context() as warmed:
         warmed.setattr(kernel, "build", forbidden)
+        warmed.setattr(kernel, "plan", forbidden)
+        warmed.setattr(kernel, "_expand_plans", forbidden)
+        warmed.setattr(kernel, "_description", forbidden)
         warmed.setattr(kernel, "_configs", forbidden)
         warmed.setattr(kernel, "_header_fingerprint", forbidden)
         warmed.setattr(tilelang.tvm.ir, "save_json", forbidden)
@@ -450,6 +453,7 @@ def test_artifact_warm_launch_uses_loaded_kernels_without_build_inputs(monkeypat
             assert report["artifact_id"] == artifact_id
             assert report["execution_policy"] == "artifact"
             assert report["source_validation"] == "identity"
+            assert report["launch_validation"] == "static_contract"
             assert report["completed"]
     D.close(session)
 
@@ -580,13 +584,15 @@ def test_artifact_new_scalar_and_eviction_require_fresh_build_validation(monkeyp
         kernel._prepare_executable(shmem_root=root, plans=plans)
 
 
-def test_artifact_keeps_dynamic_interval_and_signal_progress_checks(sealed_artifact):
+@pytest.mark.parametrize("method", ["plan", "_launch_plan"])
+def test_artifact_keeps_dynamic_interval_and_signal_progress_checks(sealed_artifact, method):
     kernel, root = sealed_artifact
+    planner = getattr(kernel, method)
     with pytest.raises(ValueError, match="outside the prepared"):
-        kernel.plan(epoch_base=3, epoch_end=4)
+        planner(epoch_base=3, epoch_end=4)
     with pytest.raises(ValueError, match="must not decrease"):
-        kernel.plan(epoch_base=3, epoch_end=6, initial_signals={(0, "Ready", 0): 100})
-    plans = kernel.plan(epoch_base=3, epoch_end=6)
+        planner(epoch_base=3, epoch_end=6, initial_signals={(0, "Ready", 0): 100})
+    plans = planner(epoch_base=3, epoch_end=6)
     with pytest.raises(ValueError, match="SHMEM root does not match"):
         kernel._prepare_executable(shmem_root=root.parent, plans=plans)
 
@@ -643,3 +649,56 @@ def test_artifact_final_report_failure_does_not_publish(monkeypatch, tmp_path):
     with pytest.raises(OSError, match="report filesystem failure"):
         kernel.build(shmem_root=root, output_dir=tmp_path / "export")
     assert kernel._active_reference["artifact"] is None
+
+
+@pytest.mark.parametrize("mode", ["disabled", "enabled", "submit_error"])
+def test_native_run_event_interval_surrounds_submission_and_reads_after_sync(monkeypatch, tmp_path, mode):
+    from testing.ascend.distributed.test_device_timing import TimingBridge
+
+    root = fake_headers(tmp_path)
+    kernel = D.compile(exchange(1, 1), profile=D.P0A_PROFILE, shmem_root=root, execution_policy="artifact", debug=False)
+    monkeypatch.setattr(tilelang, "compile", _fake_loaded_kernel)
+    kernel.build(shmem_root=root)
+    session = D.init(
+        profile=D.P0A_PROFILE,
+        rank=0,
+        device=0,
+        bootstrap="tcp://127.0.0.1:25100",
+        control=Control(),
+        bridge=TimingBridge(),
+        shmem_root=root,
+    )
+    for spec in kernel.manifest["objects"]:
+        common = dict(key=spec["key"], shape=spec["shape"], dtype=spec["dtype"])
+        if spec["kind"] == "signal":
+            D.alloc_signals(session, **common)
+        else:
+            D.alloc_symmetric(session, remote_access=spec["remote_access"], **common)
+    if mode != "disabled":
+        session.prepare_device_timing()
+    ticket = D.prepare_launch(session, kernel, channel=D.channel(session, key="comm"), epochs=1, protocol="timing")
+    session.bridge.calls.clear()
+    if mode == "submit_error":
+        reports = []
+
+        def failed_submit(plans, session, bound, report):
+            reports.append(report)
+            raise RuntimeError("injected submit failure")
+
+        monkeypatch.setattr(kernel, "_execute", failed_submit)
+        with pytest.raises(RuntimeError, match="injected submit failure"):
+            D.launch(kernel, ticket=ticket, measure_device=True)
+        assert not reports[0]["passed"]
+        assert "device_stream_seconds" not in reports[0]
+        assert not any(call[0] == "elapsed" for call in session.bridge.calls)
+        return  # The failed Session deliberately retains resources for process teardown.
+    report = D.complete(D.launch(kernel, ticket=ticket, measure_device=mode == "enabled"))
+    names = [call[0] for call in session.bridge.calls if call[0] in ("record_event", "launch", "synchronize", "elapsed")]
+    if mode == "enabled":
+        assert names == ["record_event", "launch", "record_event", "synchronize", "elapsed", "synchronize"]
+        assert report["device_stream_seconds"] == 0.00125
+        assert report["device_timing_basis"] == "acl_event_stream_interval_including_submission_gaps"
+    else:
+        assert names == ["launch", "synchronize", "synchronize"]
+        assert "device_stream_seconds" not in report
+    D.close(session)

@@ -242,6 +242,25 @@ def plan_program(program, *, rank, scalars, world_size, allow_vector=False):
             env[node.var] = _eval(node.value, env, rank)
         elif isinstance(node, tirx.For):
             flush()
+            if "td.gemm" in node.annotations:
+                from .tiled_gemm import parse_tiled_gemm
+
+                replacements = {key: tirx.const(value, key.dtype) for key, value in env.items()}
+                fixed_loop = tirx.stmt_functor.substitute(node, replacements)
+                body, inputs, output = parse_tiled_gemm(fixed_loop, list(allocations), dict(block_annotations))
+                plan.append(
+                    (
+                        "gemm",
+                        tuple(region(x) for x in inputs),
+                        region(output),
+                        [body],
+                        list(allocations),
+                        inputs,
+                        output,
+                        dict(block_annotations),
+                    )
+                )
+                return
             minimum, extent = int(_eval(node.min, env, rank)), int(_eval(node.extent, env, rank))
             if node.thread_binding is not None:
                 if node.thread_binding.thread_tag != "blockIdx.x" or extent != 1 or minimum != 0:

@@ -195,6 +195,10 @@ class ShmemBridge:
             "stream_create": (i32, [ctypes.POINTER(ptr)]),
             "stream_sync": (i32, [ptr, i32]),
             "stream_destroy": (i32, [ptr]),
+            "event_create": (i32, [ctypes.POINTER(ptr)]),
+            "event_record": (i32, [ptr, ptr]),
+            "event_elapsed": (i32, [ctypes.POINTER(ctypes.c_float), ptr, ptr]),
+            "event_destroy": (i32, [ptr]),
             "set_device": (i32, [i32]),
             "physical_device": (i32, [i32, ctypes.POINTER(i32)]),
             "soc": (ctypes.c_char_p, []),
@@ -281,6 +285,27 @@ class ShmemBridge:
 
     def synchronize(self, stream, timeout):
         self.check("stream_sync", stream, timeout * 1000)
+
+    def create_event(self):
+        event = ctypes.c_void_p()
+        self.check("event_create", ctypes.byref(event))
+        if not event.value:
+            raise RuntimeError("ACL returned a null timing event")
+        return event.value
+
+    def record_event(self, event, stream):
+        self.check("event_record", event, stream)
+
+    def event_elapsed_seconds(self, start, end):
+        milliseconds = ctypes.c_float()
+        self.check("event_elapsed", ctypes.byref(milliseconds), start, end)
+        seconds = milliseconds.value / 1000.0
+        if not math.isfinite(seconds) or seconds < 0:
+            raise RuntimeError("ACL returned an invalid event interval")
+        return seconds
+
+    def destroy_event(self, event):
+        self.check("event_destroy", event)
 
     def launch(self, kernel, args, *, device, stream):
         import tvm_ffi
@@ -408,6 +433,8 @@ class NativeSession:
         self.heap_bytes = heap_bytes
         self.error = None
         self.stream = None
+        self._timing_events = []
+        self._timing_state = "unallocated"
         if isinstance(bridge, ShmemBridge):
             global _ACTIVE_NATIVE_SESSION
             with _NATIVE_SESSION_LOCK:
@@ -671,10 +698,12 @@ class NativeSession:
         needs_launch_scalars = prim_func is not None and any(
             parameter not in prim_func.buffer_map and parameter.name != "epoch0" for parameter in prim_func.params
         )
-        # User scalars are bound by D.launch(scalars=...). The complete plan is
-        # always validated there before compilation or any device submission.
+        # User scalars are bound by D.launch(scalars=...). Launch validates the
+        # full plan or its sealed static contract plus dynamic signal state
+        # before compilation or any device submission.
         if hasattr(kernel, "plan") and not needs_launch_scalars:
-            kernel.plan(epoch_base=self._epoch, epoch_end=end)
+            validator = getattr(kernel, "_launch_plan", kernel.plan)
+            validator(epoch_base=self._epoch, epoch_end=end)
         digest = manifest_digest(manifest)
         self.preflight(
             {
@@ -770,10 +799,67 @@ class NativeSession:
             raise
 
     @_locked
+    def prepare_device_timing(self):
+        """Allocate reusable ACL timing events outside measured launches.
+
+        These measure a stream interval, including any idle time between host
+        submissions. They do not isolate the device kernel's execution time.
+        """
+        if self.state not in ("QUIESCENT", "PREPARED", "LOCAL_DONE"):
+            raise RuntimeError("timing event allocation requires an idle native Session")
+        if self._timing_events:
+            return
+        try:
+            self._activate()
+            for _ in range(2):
+                self._timing_events.append(self.bridge.create_event())
+            self._timing_state = "ready"
+        except Exception as error:
+            self.fail(error)
+            raise
+
+    @_locked
+    def begin_device_timing(self):
+        if self.state != "RUNNING" or self._timing_state != "ready":
+            raise RuntimeError("timed launch requires prepare_device_timing() and RUNNING state")
+        try:
+            self._activate()
+            self.bridge.record_event(self._timing_events[0], self.stream)
+            self._timing_state = "started"
+        except Exception as error:
+            self.fail(error)
+            raise
+
+    @_locked
+    def end_device_timing(self):
+        if self.state != "RUNNING" or self._timing_state != "started":
+            raise RuntimeError("timing end requires a matching start in RUNNING state")
+        try:
+            self.bridge.record_event(self._timing_events[1], self.stream)
+            self._timing_state = "recorded"
+        except Exception as error:
+            self.fail(error)
+            raise
+
+    @_locked
+    def device_elapsed_seconds(self):
+        if self.state != "RUNNING" or self._timing_state != "complete":
+            raise RuntimeError("timing interval must complete on the Session stream before reading")
+        try:
+            seconds = self.bridge.event_elapsed_seconds(*self._timing_events)
+            self._timing_state = "ready"
+            return seconds
+        except Exception as error:
+            self.fail(error)
+            raise
+
+    @_locked
     def synchronize(self):
         try:
             self._activate()
             self.bridge.synchronize(self.stream, self.timeout)
+            if self._timing_state == "recorded":
+                self._timing_state = "complete"
         except Exception as error:
             self.fail(error)
             raise
@@ -798,6 +884,10 @@ class NativeSession:
         self.synchronize()
         self.preflight({"close": self.generation, "launch_id": self._launch_id})
         try:
+            while self._timing_events:
+                self.bridge.destroy_event(self._timing_events[-1])
+                self._timing_events.pop()
+            self._timing_state = "unallocated"
             self.bridge.close([obj.pointer for obj in self.objects.values()], self.stream)
             self.state, self._ticket = "CLOSED", None
             self._bindings.clear()
