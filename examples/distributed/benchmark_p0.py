@@ -26,6 +26,7 @@ import tilelang.distributed as D
 
 from examples.distributed.example_allgather_gemm import TILE, allgather_gemm, make_inputs
 from examples.distributed.run_native_distributed import exchange
+from examples.distributed.summarize_p0 import save_local_evidence
 
 
 def local_gemm():
@@ -362,7 +363,7 @@ def main(argv=None):
                 "p0a_compute": "one pure AIV exchange plus ordinary local TileLang Cube kernels",
             }
             summary.update(paired_summary(reports, args.iterations))
-            (root / "summary.json").write_text(json.dumps(summary, indent=2, allow_nan=False) + "\n")
+            save_local_evidence(root, summary)
     except BaseException as error:
         result["error"] = f"{type(error).__name__}: {error}"
         traceback.print_exc()

@@ -294,6 +294,7 @@ def test_native_local_copy_requires_disjoint_storage(destination):
 
 def test_shmem_fingerprint_traverses_only_header_subtrees_and_preserves_digest(tmp_path, monkeypatch):
     import hashlib
+    import os
     from pathlib import Path
     from tilelang.ascend.distributed.transport import shmem_include_flags
 
@@ -308,15 +309,68 @@ def test_shmem_fingerprint_traverses_only_header_subtrees_and_preserves_digest(t
             digest.update(str(path.relative_to(root)).encode())
             digest.update(path.read_bytes())
     expected = "-DTL_SHMEM_HEADER_DIGEST_" + digest.hexdigest() + "=1"
-    original = Path.rglob
+    original = os.scandir
 
-    def restricted(path, pattern):
-        assert path != root, "hot path must not enumerate build/install/repository objects"
-        return original(path, pattern)
+    def restricted(path):
+        assert Path(path) != root, "hot path must not enumerate build/install/repository objects"
+        return original(path)
 
-    monkeypatch.setattr(Path, "rglob", restricted)
+    monkeypatch.setattr(os, "scandir", restricted)
     assert shmem_include_flags(root)[-1] == expected
     (root / "src/device_simt/extra.hpp").write_text("modified header")
     assert shmem_include_flags(root)[-1] != expected
     (root / "src/device_simt/extra.hpp").unlink()
     assert shmem_include_flags(root)[-1] != expected
+
+
+def test_shmem_fingerprint_preserves_component_order_and_symlink_semantics(tmp_path):
+    import hashlib
+    import os
+    from tilelang.ascend.distributed.transport import shmem_include_flags
+
+    root = fake_headers(tmp_path)
+    include = root / "include"
+    (include / "a").mkdir()
+    (include / "a/z.h").write_text("nested before sibling")
+    (include / "a.h").write_text("sibling after directory")
+    (include / ".h").write_text("suffix-only dotfile has no .h extension")
+    (include / "literal.hpp").mkdir()
+    (include / "literal.hpp/selected.h").write_text("header inside a directory ending in .hpp")
+    target = tmp_path / "outside-header"
+    target.write_text("linked original")
+    (include / "linked.hpp").symlink_to(target)
+    (include / "dangling.h").symlink_to(tmp_path / "missing")
+    outside = tmp_path / "outside-directory"
+    outside.mkdir()
+    (outside / "ignored.h").write_text("directory symlinks must not be traversed")
+    (include / "directory-link").symlink_to(outside, target_is_directory=True)
+
+    def expected():
+        digest = hashlib.sha256()
+        for path in sorted(path for tree in (root / "include", root / "src") for path in tree.rglob("*")):
+            if path.is_file() and path.suffix in {".h", ".hpp"}:
+                digest.update(str(path.relative_to(root)).encode())
+                digest.update(path.read_bytes())
+        return "-DTL_SHMEM_HEADER_DIGEST_" + digest.hexdigest() + "=1"
+
+    def checked():
+        actual = shmem_include_flags(root)[-1]
+        assert actual == expected()
+        return actual
+
+    first = checked()
+    timestamp = target.stat()
+    target.write_text("linked modified")
+    os.utime(target, ns=(timestamp.st_atime_ns, timestamp.st_mtime_ns))
+    assert checked() != first  # Full contents detect even preserved mtime.
+    added = include / "new.hpp"
+    added.write_text("new header")
+    with_added = checked()
+    added.unlink()
+    assert checked() != with_added
+    replacement = tmp_path / "replacement"
+    replacement.write_text("replacement target")
+    replacement.replace(target)
+    replaced = checked()
+    target.unlink()
+    assert checked() != replaced  # A now-dangling header link is omitted.

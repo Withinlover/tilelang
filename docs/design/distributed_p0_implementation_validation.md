@@ -399,3 +399,38 @@ prepare、输入暂存、launch/complete、Output 回读；没有真实设备、
 P0-A 的额外本地 GEMM。不能将约 39 倍的 P0-B Host execution 降幅当作服务器加速比。
 完整 header 内容校验和源码序列化等仍有毫秒级成本，尚未建立低延迟性能达标结论。
 下一轮必须保持原服务器口径重测，并根据新增分段定位剩余成本。
+
+## 12. 精简回传报告与保留校验的目录遍历优化（2026-10-27）
+
+用户反馈新性能报告超过一万行，且加速比仍只有 `0.0x`。目前尚未收到该轮分段
+数据，不能把剩余耗时归因于设备通信或 GEMM，也没有形成性能改善的实机结论。
+
+新增标准库离线入口 `examples/distributed/summarize_p0.py`，可直接读取已有结果目录
+或旧 schema 1/2 的完整 JSON，不导入 TileLang、不初始化设备、不重跑测试。输出
+`report.md` 与 `compact.json`，只保留固定枚举、有限数值、版本和完整 commit 哈希；
+命令、绝对路径、原始错误文本和逐次样本留在本地。缺失分段显示 `null`，既有失败、
+退出码、超时及未执行设备状态不会因导出改变。性能比率同时列出 HCCL/当前模式和
+当前模式/HCCL，避免低于 1 的比率含义不清。
+
+统一入口及性能 worker 后续将完整证据写入 `detail.json`，默认 `summary.json`
+改为 schema 3 分享摘要，并直接生成 `report.md`；验收判断仍读取完整证据，兼容
+旧 worker 的完整 summary，但不接受分享摘要作为验收证据。离线导出使用原运行的
+provenance，不将当前工具版本的 commit 冒充旧测量版本。对用户此前回传的旧报告，
+实际导出 Markdown **59 行、2876 字节**，JSON **7392 字节**。大量样本的合成测试
+确认输出尺寸不随样本数组增长。运行及反馈步骤见
+[融合路径验收指南](../testing/distributed_fused.md#已有大报告的离线精简)。
+
+同时将 SHMEM include/src 遍历改为 `os.scandir`，每次仍读取并 hash 所有头文件内容，
+保持按路径分量排序、文件/目录符号链接行为及同 mtime 内容变化检测。实际 SDK 的
+compiler flags 和 header digest 与 `69b9da8b` 一致。本机 205 个头文件、约 1.94 MB
+的隔离测量中，完整指纹检查中位数从 3.777 ms 降为 1.457 ms；测试 Bridge/Control
+及空 kernel 的 P0-A/P0-B execution 从 6.947/8.203 ms 降为 5.098/6.286 ms。
+这些是 Host 隔离数据，没有 TCP、真实设备或 P0-A 的额外本地 GEMM，不能替代
+服务器性能结果。本轮未移除源码、ABI、header 或跨 rank 检查，也未改变计时边界。
+
+本轮实际验证：统一 CPU 回归 **387 passed、0 skipped、6 deselected**；全新缓存的
+`p0b-gemm` 真实 SDK 编译通过，覆盖两个 rank，同时验证新报告写入路径。未重跑
+完整 SDK 矩阵、CANN 计算片段或真实设备测试；生成设备程序及其同步协议没有改动。
+CPU、SDK 与精简报告样本位于 `output/distributed/compact_report_20261027/`，Host
+隔离测量位于 `output/distributed/performance_host_69b9da8_review/`，均不随 Git 提交。
+真实多卡完整验收和性能结论仍等待相应服务器结果。

@@ -21,6 +21,7 @@ observed. Hardware validation must exercise changing data across those epochs.
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import shlex
@@ -188,13 +189,33 @@ def shmem_include_flags(shmem_root):
     if missing:
         raise ValueError("SHMEM_ROOT must contain complete SHMEM include/ and src/device/ headers: " + ", ".join(missing))
     paths = [root / "include", root / "src", root / "src/device", root / "src/device_simt"]
+    headers = []
+
+    def collect(directory, parts):
+        # Match rglob's directory-symlink behavior. DirEntry reuses directory
+        # type information instead of stat-ing every file and directory twice.
+        try:
+            with os.scandir(directory) as entries:
+                entries = list(entries)
+        except PermissionError:
+            return  # pathlib.rglob also skips unreadable directories.
+        for entry in entries:
+            relative = (*parts, entry.name)
+            if entry.is_dir(follow_symlinks=False):
+                collect(entry.path, relative)
+            elif os.path.splitext(entry.name)[1] in {".h", ".hpp"} and entry.is_file():
+                headers.append((relative, entry.path))
+
+    for tree in ("include", "src"):
+        collect(root / tree, (tree,))
     digest = hashlib.sha256()
-    # include/ and src/ contain every selected header. Avoid walking unrelated
-    # build/install trees, while preserving the exact path/content digest.
-    for path in sorted(path for tree in paths[:2] for path in tree.rglob("*")):
-        if path.is_file() and path.suffix in {".h", ".hpp"}:
-            digest.update(str(path.relative_to(root)).encode())
-            digest.update(path.read_bytes())
+    # Path sorting compares components, not full strings: a/z.h precedes a.h.
+    # Keep that ordering and hash every byte on every call, including symlink
+    # file targets. No metadata/content cache can hide an SDK edit.
+    for parts, path in sorted(headers):
+        digest.update(os.path.join(*parts).encode())
+        with open(path, "rb") as header:
+            digest.update(header.read())
     # The backend binary cache includes compiler options, not transitive header
     # bytes. This macro also invalidates shared JIT caches after an SDK edit.
     return [*(shlex.quote("-I" + str(path)) for path in paths), "-DTL_SHMEM_HEADER_DIGEST_" + digest.hexdigest() + "=1"]

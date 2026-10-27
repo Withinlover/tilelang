@@ -62,11 +62,15 @@ def test_performance_deadline_overrides_successful_worker_summary(tmp_path, monk
 
     monkeypatch.setattr(runner, "run_command", finished_worker)
     result = runner.main(["--stages", "performance", "--output-dir", str(tmp_path), "--shmem-root", str(runner.ROOT)])
-    report = json.loads(next(tmp_path.glob("run_*/summary.json")).read_text())
+    report = json.loads(next(tmp_path.glob("run_*/detail.json")).read_text())
+    compact = json.loads(next(tmp_path.glob("run_*/summary.json")).read_text())
     assert result == int(timed_out)
     assert report["passed"] is not timed_out
     assert ("performance_comparison" in report) is not timed_out
     assert report["device_acceptance"] == "not_run"
+    assert compact["reported_device_acceptance"] == "not_run"
+    assert "results" not in compact and "passed" not in compact
+    assert assess_performance({"exit_code": 0, "timed_out": False}, compact, iterations=20)["status"] == "failed"
 
 
 @pytest.mark.parametrize("damage", ["missing_rank", "missing_check", "wrong_output", "wrong_scope", "missing_p95", "wrong_count"])
@@ -213,7 +217,9 @@ def test_benchmark_main_preserves_timing_boundaries_and_nested_attribution(tmp_p
         )
         monkeypatch.setattr(benchmark.D, "close", lambda _: None)
     assert benchmark.main(["--mode", mode, "--warmup", "1", "--iterations", "2", "--output-dir", str(tmp_path)]) == 0
-    summary = json.loads((tmp_path / "summary.json").read_text())
+    summary = json.loads((tmp_path / "detail.json").read_text())
+    compact = json.loads((tmp_path / "summary.json").read_text())
+    assert "ranks" not in compact and "passed" not in compact
     assert summary["correctness_scope"] == "benchmark_workload_only" and summary["full_device_acceptance"] == "not_assessed"
     assert summary["execution"]["count"] == summary["end_to_end"]["count"] == 2
     assert assess_performance({"exit_code": 0, "timed_out": False}, summary, iterations=2)["status"] == "passed"
@@ -227,6 +233,141 @@ def test_benchmark_main_preserves_timing_boundaries_and_nested_attribution(tmp_p
             assert ("collective_submit" in stages) is (mode == "hccl")
             assert ("launch" in stages) is (mode != "hccl")
             assert bool(sample["native_run_seconds"]) is (mode != "hccl")
+
+
+@pytest.mark.parametrize("schema", [1, 2])
+def test_offline_report_preserves_metrics_filters_private_data_and_is_bounded(tmp_path, schema):
+    from examples.distributed.summarize_p0 import compact_report, main as summarize, render_markdown
+
+    private = "private_account.private_hostname"
+    report = {"schema_version": 1, "passed": True, "device_acceptance": "not_run", "requested_stages": ["performance"], "results": []}
+    for mode, factor in (("hccl", 1), ("p0a", 10), ("p0b", 100)):
+        evidence = performance_evidence(iterations=3)
+        evidence.update(
+            schema_version=schema,
+            mode=mode,
+            rounds=3,
+            slots=2,
+            tile=64,
+            dtype="bfloat16",
+            output_dtype="float32",
+            first_build_or_cache_load_seconds=[1.0, 2.0],
+            first_execution_seconds=[0.02, 0.03],
+            first_end_to_end_seconds=[0.04, 0.05],
+        )
+        for key in ("execution", "end_to_end"):
+            evidence[key] = {"samples_seconds": [factor * value for value in (0.001, 0.002, 0.003)], "median_seconds": factor * 0.002}
+        if schema == 1:
+            ranks = evidence.pop("ranks")
+            directory = tmp_path / "performance" / mode
+            directory.mkdir(parents=True)
+            for rank in ranks:
+                # Schema 1 did not yet record per-iteration passed/mismatch fields.
+                for check in rank["checks"]:
+                    check.pop("passed")
+                    check.pop("mismatches")
+                    check.pop("nonfinite")
+                (directory / f"rank{rank['rank']}.json").write_text(json.dumps(rank))
+        else:
+            evidence["stages"] = {"prepare": {"median_seconds": 0.004}, private: {"median_seconds": 123.0}}
+            evidence["native_run"] = {"plan_validation": {"median_seconds": 0.005}, private: {"median_seconds": 123.0}}
+        report["results"].append(
+            {
+                "stage": "performance",
+                "mode": mode,
+                "status": "passed",
+                "summary": evidence,
+                "process": {"exit_code": 0, "timed_out": False, "command": ["/home/" + private]},
+                "manifest": str(tmp_path / "must_not_read.json"),
+                "error": "RuntimeError: " + private,
+            }
+        )
+    source = tmp_path / "summary.json"
+    original = json.dumps(report)
+    source.write_text(original)
+    (tmp_path / "must_not_read.json").write_text("not JSON: " + private)
+    (tmp_path / "provenance.json").write_text(
+        json.dumps(
+            {
+                "commit": {"exit_code": 0, "output": "a" * 40},
+                "packages": {"torch": "2.8.0.post1", "torch_npu": "2.8.0+" + private},
+                "status": {"output": "/home/" + private},
+            }
+        )
+    )
+    out = tmp_path / "shareable"
+    assert summarize([str(source), "--output-dir", str(out)]) == 0
+    first = (out / "compact.json").read_text()
+    markdown = (out / "report.md").read_text()
+    compact = json.loads(first)
+    assert compact["commit"] == "a" * 40
+    assert compact["versions"]["torch"] == "2.8.0.post1" and compact["versions"]["torch_npu"] is None
+    assert compact["new_device_execution"] is False and compact["reported_device_acceptance"] == "not_run"
+    value = compact["performance"]["p0a"]
+    assert value["execution"] == {"samples": 3, "median_ms": 20.0, "p95_ms": pytest.approx(29.0)}
+    assert value["numerics"]["max_abs_error"] == 1e-7
+    assert value["first_rank_max_ms"]["first_build_or_cache_load"] == 2000.0
+    assert value["ratios"]["execution"] == {"hccl_over_mode": 0.1, "slowdown_x": 10.0}
+    assert value["stages_median_ms"]["prepare"] == (None if schema == 1 else 4.0)
+    assert value["native_median_ms"]["plan_validation"] == (None if schema == 1 else 5.0)
+    assert value["stage_availability"] == ("legacy_no_stage_timings" if schema == 1 else "available")
+    assert private not in first + markdown and "/home/" not in first + markdown and "samples_seconds" not in first
+    assert len(first.encode()) < 16000 and 30 <= len(markdown.splitlines()) <= 60
+    assert summarize([str(source), "--output-dir", str(out)]) == 0
+    assert (out / "compact.json").read_text() == first and source.read_text() == original
+    # A shareable-only copy remains exportable, but can never pass assessment.
+    assert summarize([str(out / "compact.json"), "--output-dir", str(tmp_path / "reshare")]) == 0
+    reexport = json.loads((tmp_path / "reshare/compact.json").read_text())
+    assert reexport["reported_device_acceptance"] == "not_run" and reexport["new_device_execution"] is False
+    assert assess_performance({"exit_code": 0, "timed_out": False}, reexport, iterations=3)["status"] == "failed"
+    # Increasing raw iterations changes only bounded scalar fields in the export.
+    large = deepcopy(report)
+    for item in large["results"]:
+        item["summary"]["execution"]["samples_seconds"] *= 1000
+        item["summary"]["end_to_end"]["samples_seconds"] *= 1000
+        for rank in item["summary"].get("ranks", []):
+            rank["checks"] *= 1000
+    large_compact = compact_report(large)
+    assert len(json.dumps(large_compact)) < 16000
+    assert len(render_markdown(large_compact).splitlines()) == len(markdown.splitlines())
+
+
+def test_report_handles_missing_extreme_values_and_names_failed_cases():
+    from examples.distributed.summarize_p0 import compact_report, render_markdown
+
+    source = {
+        "schema_version": 1,
+        "passed": False,
+        "error": "ValueError: /home/private_user/private_host",
+        "results": [
+            {
+                "stage": "device",
+                "status": "failed",
+                "case": {"name": "p0b-hot-slot", "rounds": 7, "slots": 1, "launches": 3},
+                "process": {"exit_code": -9, "timed_out": True},
+                "rank_exit_codes": [0, -9],
+            },
+            {"stage": "performance", "mode": "hccl", "summary": {"execution": {"median_seconds": 1e99}}},
+            {
+                "stage": "performance",
+                "mode": "p0b",
+                "summary": {
+                    "execution": {"median_seconds": 5e-324},
+                    "rounds": 10**400,
+                    "stages": {"prepare": {"median_seconds": float("nan")}},
+                },
+            },
+        ],
+    }
+    compact = compact_report(source, provenance={"commit": "abcdef0"})
+    text = json.dumps(compact, allow_nan=False) + render_markdown(compact)
+    assert compact["commit"] is None
+    assert compact["performance"]["p0b"]["parameters"]["rounds"] is None
+    assert compact["performance"]["p0b"]["stages_median_ms"]["prepare"] is None
+    assert compact["performance"]["p0b"]["ratios"]["execution"]["hccl_over_mode"] is None
+    assert compact["performance"]["p0a"] is None
+    assert "p0b-hot-slot exit=-9,timeout=true" in text and "ValueError" in text
+    assert "private_user" not in text and "private_host" not in text
 
 
 def device_evidence(*, negative=False):

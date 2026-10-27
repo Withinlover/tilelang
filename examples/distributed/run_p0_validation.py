@@ -20,6 +20,8 @@ import tempfile
 import time
 import xml.etree.ElementTree as ET
 
+from examples.distributed.summarize_p0 import save_local_evidence
+
 
 @dataclass(frozen=True)
 class Case:
@@ -420,7 +422,11 @@ def main(argv=None):
                     process = run_command(
                         command, directory, args.timeout, env_overrides={"P0_BENCH_CACHE_ROOT": str(directory / "cold-cache")}
                     )
-                    path = directory / "summary.json"
+                    # Validate complete evidence before generating the bounded
+                    # top-level report. A shareable summary is not evidence.
+                    path = directory / "detail.json"
+                    if not path.is_file():
+                        path = directory / "summary.json"  # Older workers.
                     summary = json.loads(path.read_text()) if path.is_file() else {}
                     results.append(
                         {
@@ -439,14 +445,14 @@ def main(argv=None):
                     result = run_case(args, case, stage, root / stage / case.name)
                     results.append(result)
                     report["results"] = report["results"] + [result]
-                    write_json(root / "summary.json", report)
+                    save_local_evidence(root, report, provenance=provenance)
                     print(f"{stage}/{case.name}: {result['status']}", flush=True)
                     if result["status"] != "passed" and not args.keep_going:
                         break
                 # Results have already been persisted individually.
                 results = []
             report["results"].extend(results)
-            write_json(root / "summary.json", report)
+            save_local_evidence(root, report, provenance=provenance)
             if any(result["status"] != "passed" for result in report["results"]) and not args.keep_going:
                 break
         performance = {item["mode"]: item for item in report["results"] if item["stage"] == "performance"}
@@ -477,7 +483,7 @@ def main(argv=None):
         report["error"] = f"{type(error).__name__}: {error}"
         raise
     finally:
-        write_json(root / "summary.json", report)
+        save_local_evidence(root, report, provenance=provenance)
     print(
         json.dumps({"passed": report["passed"], "device_acceptance": report["device_acceptance"], "summary": str(root / "summary.json")}),
         flush=True,

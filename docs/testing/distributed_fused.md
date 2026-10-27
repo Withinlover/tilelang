@@ -136,6 +136,45 @@ CPU 阶段的 pytest XML 单独记录 passed/failed/error/skip；此阶段排除
 两 rank 使用不同进程组，失败或超时会终止相应子进程；保存原始退出码。
 首次编译过慢可以增大超时，不能据此放宽数值或协议验收。
 
+## 已有大报告的离线精简
+
+已有报告过大时，**无需重跑 NPU**。更新脚本后直接用标准库 Python 离线导出：
+
+```bash
+# 输入可为旧 schema 1/2 的顶层 summary.json，也可为整个 run 目录。
+python3 examples/distributed/summarize_p0.py \
+  "$P0_RESULTS/run_xxx/summary.json" \
+  --output-dir "$P0_RESULTS/run_xxx/shareable"
+cat "$P0_RESULTS/run_xxx/shareable/report.md"
+
+# 省略 --output-dir 时，在输入所在目录写 report.md 和 compact.json。
+python3 examples/distributed/summarize_p0.py "$P0_RESULTS/run_xxx"
+```
+
+模块形式 `python -m examples.distributed.summarize_p0 ...` 同样可用。该工具不导入 TileLang、
+不初始化设备、不要求 CANN/torch_npu，也不重新运行编译、正确性或性能测试。
+`report.md` 固定约 59 行，`compact.json` 使用固定字段及有界 case 列表；不随迭代样本数增长。
+每 mode 一行核心结果，附参数、首次 build/cache-load、首次执行/E2E 的两 rank 最大值，以及
+外层和 native 分段中位数。除 HCCL/候选比值外，同时报告候选/HCCL 的 `slowdown_x`，
+避免用低精度的 `0.0x` 隐藏真实差距；缺失、非有限或不可表示的字段为 `null`。
+
+分享版只保留白名单 commit、依赖版本、case 参数、退出码/超时、数值误差及聚合统计。
+账号、主机名、绝对路径、原始命令、原始错误文本和逐次样本不复制到分享文件；错误仅保留
+允许的 `error_types`。读取旧报告只检查固定 `summary.json`/`detail.json`/`provenance.json`
+以及 `performance/<mode>/rank0.json`、`rank1.json`，不跟随 JSON 中记录的任意文件路径。
+没有 provenance 时 commit 为 `null`，不会拿当前 checkout 的 commit 冒充原测量版本。
+旧 schema 1 无分段时明确标为 `legacy_no_stage_timings`；缺少逐次检查字段不会补成零错误。
+
+重复导出同一原始输入会覆盖自己的 `report.md`/`compact.json`，不会修改原始 summary/detail。
+仅持有分享版 `compact.json` 时也可再次导出，内容会再次经过相同白名单过滤。
+导出记录 `new_device_execution=false`，表示**导出动作未新增设备执行**，不是否认原报告的设备记录。
+`reported_passed`、`reported_device_acceptance` 只转述原证据状态，导出器不重新授予验收通过。
+分享摘要不能作为 `assess_performance` 的完整证据输入。
+
+后续新运行默认将完整数据保存在本地 `detail.json` 和 `rank*.json`，`summary.json` 使用
+同样有界的 schema 3 分享格式，并自动生成 `report.md`。统一入口先读取完整性能 detail、
+执行原严格验收，再生成顶层摘要；省略详细字段不会放宽通过条件。
+
 ## 性能口径
 
 ```bash
@@ -171,7 +210,7 @@ CPU 数值校验逐次执行；任一次失败即无有效性能通过。
 各自的中位数相减或相加估计某个阶段。
 `performance_comparison` 的比值为 HCCL 中位数除以候选中位数，值大于 1 才表示相同口径更快。
 
-性能报告 schema 2 保留原 `execution`/`end_to_end` 的边界，并新增不改变协议与同步动作的分段：
+完整性能 `detail.json` 的 schema 2 保留原 `execution`/`end_to_end` 的边界，并记录不改变协议与同步动作的分段：
 
 | `stages` 字段 | Host wall time 覆盖内容 |
 | --- | --- |
@@ -203,7 +242,7 @@ p95 不能相加还原整体时间。`outside_e2e_alignment_seconds` 记录原�
 未实测前不承诺加速比。
 
 每次迭代（含 warmup）的独立 FP64 oracle 检查保存 `passed`、`elements`、`mismatches`、
-`nonfinite`、`max_abs_error` 和容差。两 rank 的结果与分段记录一并保存在性能 `summary.json`，
+`nonfinite`、`max_abs_error` 和容差。两 rank 的结果与分段记录一并保存在本地性能 `detail.json`，
 缺 rank、缺迭代、数值失败、无效样本或超时均不通过。
 `correctness_scope=benchmark_workload_only`、`full_device_acceptance=not_assessed` 表示该报告
 只证明这些合成输入的本次性能 workload 正确；它没有替代 put/get、hot-slot、多 launch、
@@ -213,15 +252,18 @@ p95 不能相加还原整体时间。`outside_e2e_alignment_seconds` 记录原�
 
 每次统一运行创建 `output/distributed/p0-acceptance/run_*/`，不会覆盖历史记录：
 
-- `summary.json`：机器可读阶段/case 状态、退出码、超时、数值与性能摘要。
+- `summary.json`：schema 3 有界分享摘要；`reported_*` 忠实转述原验收状态。
+- `report.md`：约 59 行的分享报告；不含原始命令、路径或逐次样本。
+- `detail.json`：完整的阶段/case 验收证据、原始进程/性能报告，仅留本地。
 - `provenance.json`：Git commit、工作区状态与子模块 revision。
 - `cpu/pytest.xml`、`cpu/process.log`：回归总数及 skip 证据。
 - `compile/<case>/artifacts/`：源码、TIR、ABI、SDK build 产物与 `validation.json`。
 - `device/<case>/artifacts/p0_native_*/`：原始合成输入、各 rank 日志、输出、`worker.json` 和全局 `manifest.json`。
-- `performance/<mode>/`：两个 rank JSON、torchrun 各 rank stdout/stderr、独立 cache 和性能汇总。
+- `performance/<mode>/`：完整 `detail.json`、两个 rank JSON、torchrun 各 rank stdout/stderr、独立 cache，以及有界 `summary.json`/`report.md`。
 - 每个阶段的 `command.json`、`process.json`、`process.log` 保留命令、退出码和超时证据。
 
-`device_acceptance=not_run` 表示没有执行设备用例；`passed_requested_cases` 只对本次选择的
+本地 detail 的 `device_acceptance`（分享版为 `reported_device_acceptance`）中，`not_run`
+表示没有执行设备用例；`passed_requested_cases` 只对本次选择的
 case 有效。首版完整验收应执行全部默认 case，两个 rank 均退出 0、物理执行标志为 true，
 P0-A/P0-B 每次恰有一个物理 kernel，独立数值/信号检查通过，负例被精确识别，全部 Session 正常关闭。
 性能是独立阶段；正确性通过不等于有性能收益。
@@ -231,7 +273,9 @@ P0-A/P0-B 每次恰有一个物理 kernel，独立数值/信号检查通过，�
 TCPStore 的 loopback 与反向解析问题见[原生排障](distributed_native.md)。
 `physical_kernel_count` 不等于 1、缺少某 rank 日志/输出、超时或信号不符均为失败，不能仅看顶层进程曾启动。
 
-请检查和脱敏后回传：commit/SHMEM revision、SDK 与 torch/torch_npu 版本、设备型号及逻辑拓扑、
+优先检查后回传 `report.md` 或 `compact.json`/新版 `summary.json`，无需粘贴上万行 detail。
+这些报告包含 commit/SHMEM revision、依赖版本、case 参数、退出/超时、误差和聚合性能。
+需要进一步诊断时再提供经检查的补充字段：SDK 版本、设备型号及逻辑拓扑、
 阶段/case/shape/dtype/rounds/slots/launches、各 rank 退出码、超时标记、错误类型与首条错误、
 每次 epoch 区间和最终 READY/ACK、数值误差与 mismatches、物理 kernel 数、负例检测结果、
 性能口径/批量方式/样本数/中位数/min/max/p90/p95、各 rank 的 `stages` 和嵌套 `native_run`
