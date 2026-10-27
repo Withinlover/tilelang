@@ -14,6 +14,7 @@ import json
 import math
 from pathlib import Path
 import tempfile
+import time
 
 import tilelang
 from tilelang import tvm
@@ -150,9 +151,7 @@ class NativeCompiledProgram:
         if "epoch0" in values and values["epoch0"] != epoch_base:
             fail("epoch0 must equal the prepared native epoch base")
         values.setdefault("epoch0", epoch_base)
-        plans = {}
-        for rank in range(2):
-            plans[rank], _ = self._plan_program(self.prim_func, rank=rank, scalars=values, world_size=2)
+        plans = self._expand_plans(values)
         published = [
             instruction[5] if instruction[0] == "put_signal" else instruction[2]
             for plan in plans.values()
@@ -206,6 +205,12 @@ class NativeCompiledProgram:
                         fail("native transfer endpoints require equal dtype and count")
         self._check_progress(plans, epoch_base, initial_signals=initial_signals)
         return plans
+
+    def _expand_plans(self, values):
+        return {rank: self._plan_program(self.prim_func, rank=rank, scalars=values, world_size=2)[0] for rank in (0, 1)}
+
+    def _describe_plans(self, plans):
+        return {str(rank): [describe_instruction(item) for item in plan] for rank, plan in plans.items()}
 
     @staticmethod
     def _check_progress(plans, epoch_base, *, initial_signals=None):
@@ -380,6 +385,8 @@ class NativeCompiledProgram:
         return self._kernels
 
     def run(self, *, session, ticket, buffers=None, scalars=None, **kwargs):
+        started = time.perf_counter()
+        timings = {}
         if kwargs:
             fail(f"unsupported native launch options: {sorted(kwargs)}")
         if self.header_fingerprint is None:
@@ -393,12 +400,16 @@ class NativeCompiledProgram:
         bound = dict(registered if buffers is None else buffers)
         if set(bound) != set(self._specs):
             fail("native buffer bindings must match exactly the compiled symmetric objects")
+        timings["validate_bindings"] = time.perf_counter() - started
+        stamp = time.perf_counter()
         plans = self.plan(
             scalars=scalars,
             epoch_base=ticket.base,
             epoch_end=ticket.end,
             initial_signals=None if binding is None else binding.signal_values,
         )
+        timings["plan_validation"] = time.perf_counter() - stamp
+        stamp = time.perf_counter()
         for key in self._specs:
             if key not in bound or bound[key] is not registered.get(key):
                 fail(f"native binding {key!r} must use its Session-owned symmetric allocation")
@@ -408,7 +419,9 @@ class NativeCompiledProgram:
         expected = {rank: (1 - rank,) for rank in range(2)}
         if peers != expected:
             fail("native channel must contain the single other rank for each participant")
-        plan_json = {str(rank): [describe_instruction(item) for item in plan] for rank, plan in plans.items()}
+        plan_json = self._describe_plans(plans)
+        timings["validate_bindings"] += time.perf_counter() - stamp
+        stamp = time.perf_counter()
         session.preflight(
             {
                 "source_sha256": self.source_sha256,
@@ -417,6 +430,8 @@ class NativeCompiledProgram:
                 "plans": plan_json,
             }
         )
+        timings["plan_preflight"] = time.perf_counter() - stamp
+        stamp = time.perf_counter()
         build_error = None
         try:
             self.build(
@@ -426,7 +441,11 @@ class NativeCompiledProgram:
             )
         except Exception as error:
             build_error = error
+        timings["build_or_cache_validation"] = time.perf_counter() - stamp
+        stamp = time.perf_counter()
         session.preflight({"compiled": build_error is None, "error": None if build_error is None else str(build_error)})
+        timings["build_preflight"] = time.perf_counter() - stamp
+        stamp = time.perf_counter()
         if build_error is not None:
             raise build_error
         directory = None
@@ -453,9 +472,15 @@ class NativeCompiledProgram:
             "errors": [],
         }
 
+        timings["report_finalize"] = time.perf_counter() - stamp
+        stamp = time.perf_counter()
         try:
             self._execute(plans, session, bound, report)
+            timings["bind_and_submit"] = time.perf_counter() - stamp
+            stamp = time.perf_counter()
             session.synchronize()
+            timings["stream_sync"] = time.perf_counter() - stamp
+            stamp = time.perf_counter()
             if binding is not None:
                 signals = self._check_progress(plans, ticket.base, initial_signals=binding.signal_values)
                 report["published_signals"] = [[*key, value] for key, value in sorted(signals.items())]
@@ -465,6 +490,10 @@ class NativeCompiledProgram:
             raise
         finally:
             report["phases_count"] = len(report["phases"])
+            timings["report_finalize"] += time.perf_counter() - stamp
+            timings["total"] = time.perf_counter() - started
+            report["timing_basis"] = "host_wall"
+            report["timing_seconds"] = timings
             if directory is not None:
                 _json(directory / "manifest.json", report)
         return report

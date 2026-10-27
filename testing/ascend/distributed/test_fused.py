@@ -116,6 +116,21 @@ def test_fused_session_one_launch_physical_signal_abi_and_cache(monkeypatch, tmp
         ticket = D.prepare_launch(session, kernel, channel=channel, epochs=1, protocol="fused-abi")
         result = D.complete(D.launch(kernel, ticket=ticket))
         assert result["physical_kernel_count"] == 1
+        assert result["timing_basis"] == "host_wall"
+        timings = result["timing_seconds"]
+        assert set(timings) == {
+            "validate_bindings",
+            "plan_validation",
+            "plan_preflight",
+            "build_or_cache_validation",
+            "build_preflight",
+            "bind_and_submit",
+            "stream_sync",
+            "report_finalize",
+            "total",
+        }
+        assert all(value >= 0 for value in timings.values())
+        assert timings["total"] >= sum(value for key, value in timings.items() if key != "total")
         assert submitted[-1][-1] == base
         views = submitted[-1][:-1]
         assert len(views) == len(kernel.manifest["objects"])
@@ -206,3 +221,154 @@ def test_fused_vector_rejects_out_of_bounds_lanes():
     block = tirx.SBlock([], [], [], "SIMD_VF", tirx.Evaluate(pointer))
     with pytest.raises(ValueError, match="vector access exceeds"):
         _verify_vector_memory(block, [ub])
+
+
+@pytest.mark.parametrize("container", ["body", "allocations", "inputs", "annotations"])
+def test_fused_plan_cache_does_not_expose_mutable_containers(container, tmp_path):
+    kernel = D.compile(allgather_gemm(1, 1), profile=D.P0B_PROFILE)
+    original = kernel.plan()
+    before = {r: tilelang.tvm.ir.save_json(f) for r, f in kernel._funcs().items()}
+    gemm = next(item for item in original[0] if item[0] == "gemm")
+    if container == "annotations":
+        gemm[7]["unexpected"] = 1
+    else:
+        gemm[{"body": 3, "allocations": 4, "inputs": 5}[container]].clear()
+    with pytest.raises(ValueError, match="validated current plan"):
+        kernel.build(shmem_root=fake_headers(tmp_path), plans=original)
+    restored = kernel.plan()
+    restored_gemm = next(item for item in restored[0] if item[0] == "gemm")
+    assert restored_gemm[3] and restored_gemm[4] and restored_gemm[5]
+    assert "unexpected" not in restored_gemm[7]
+    assert {r: tilelang.tvm.ir.save_json(f) for r, f in kernel._funcs().items()} == before
+
+
+def test_fused_same_epoch_cache_preserves_interval_and_progress_checks(monkeypatch):
+    kernel = D.compile(exchange(3, 1), profile=D.P0A_PROFILE)
+    calls = []
+    actual = kernel._plan_program
+
+    def observed(*args, **kwargs):
+        calls.append(kwargs["scalars"])
+        return actual(*args, **kwargs)
+
+    monkeypatch.setattr(kernel, "_plan_program", observed)
+    kernel.plan(epoch_base=3, epoch_end=6)
+    count = len(calls)
+    kernel.plan(epoch_base=3, epoch_end=6)
+    assert len(calls) == count
+    with pytest.raises(ValueError, match="outside the prepared"):
+        kernel.plan(epoch_base=3, epoch_end=4)
+    # Cached expansion cannot reuse a previous progress result: stale high
+    # signals would make the new publications decrease.
+    with pytest.raises(ValueError, match="must not decrease"):
+        kernel.plan(epoch_base=3, epoch_end=6, initial_signals={(0, "Ready", 0): 100})
+
+
+def test_fused_scalar_specializations_are_distinct_and_bounded():
+    from tvm import tirx
+
+    original = exchange(1, 1)
+    choice = tirx.Var("choice", "int32")
+    program = tirx.PrimFunc([*original.params, choice], original.body, buffer_map=original.buffer_map, attrs=original.attrs)
+    kernel = D.compile(program, profile=D.P0A_PROFILE)
+    for value in range(10):
+        kernel.plan(scalars={"choice": value})
+        kernel._funcs()
+    assert len(kernel._reference_cache) == 4
+    assert len(kernel._expanded_cache) <= 8
+    assert len(kernel._description_cache) <= 128
+    assert len({key for key in kernel._reference_cache}) == 4
+    with pytest.raises(ValueError, match="scalar integer values"):
+        kernel.plan(scalars={"choice": 1.5})
+
+
+def test_fused_warm_build_revalidates_headers_and_helper(monkeypatch, tmp_path):
+    root = fake_headers(tmp_path)
+    kernel = D.compile(exchange(1, 1), profile=D.P0A_PROFILE, shmem_root=root)
+    monkeypatch.setattr(tilelang, "compile", lambda *args, **kwargs: object())
+    plans = kernel.plan()
+    kernel.build(shmem_root=root, plans=plans)
+    (root / "include/shmem.h").write_text("changed after cache warmup")
+    with pytest.raises(ValueError, match="SHMEM device headers changed"):
+        kernel.build(shmem_root=root, plans=plans)
+
+
+@pytest.mark.parametrize("case", ["put", "get", "vector", "gemm"])
+def test_fused_affine_epoch_proof_reuses_validated_expansion(monkeypatch, case):
+    source = allgather_gemm(3, 1) if case == "gemm" else vector_exchange(3, 1) if case == "vector" else exchange(3, 1, get=case == "get")
+    kernel = D.compile(source, profile=D.P0B_PROFILE if case == "gemm" else D.P0A_PROFILE)
+    first = kernel.plan()
+    assert kernel._active_reference["proof"] is not None
+    monkeypatch.setattr(kernel, "_plan_program", lambda *args, **kwargs: pytest.fail("proven epoch translation replanned source"))
+    second = kernel.plan(epoch_base=9, epoch_end=12)
+    for rank in (0, 1):
+        for before, after in zip(first[rank], second[rank]):
+            if before[0] in ("signal", "wait_signal"):
+                assert after[2] == before[2] + 9
+
+
+def test_fused_unproven_epoch_control_falls_back_to_actual_expansion(monkeypatch):
+    from tvm import tirx
+
+    original = exchange(1, 1)
+    epoch = next(param for param in original.params if param.name == "epoch0")
+    source = original.with_body(tirx.IfThenElse(epoch >= 2, original.body, original.body))
+    kernel = D.compile(source, profile=D.P0A_PROFILE)
+    kernel.plan()
+    assert kernel._active_reference["proof"] is None
+    calls = []
+    actual = kernel._plan_program
+
+    def observed(*args, **kwargs):
+        calls.append(kwargs["rank"])
+        return actual(*args, **kwargs)
+
+    monkeypatch.setattr(kernel, "_plan_program", observed)
+    kernel.plan(epoch_base=2, epoch_end=3)
+    assert calls == [0, 1]
+
+
+def test_fused_non_affine_epoch_hidden_at_zero_and_one_is_rejected():
+    from tvm import tirx
+
+    original = exchange(1, 1)
+    epoch = next(param for param in original.params if param.name == "epoch0")
+    body = tirx.stmt_functor.substitute(original.body, {epoch: epoch + epoch * (epoch - 1)})
+    kernel = D.compile(original.with_body(body), profile=D.P0A_PROFILE)
+    kernel.plan()
+    assert kernel._active_reference["proof"] is None
+    with pytest.raises(ValueError, match="epoch0 may only translate"):
+        kernel.plan(epoch_base=2)
+
+
+def test_fused_epoch_proof_does_not_hide_intermediate_overflow():
+    from tvm import tirx
+    from tilelang.distributed.abi import MAX_EPOCH
+
+    original = exchange(1, 1)
+    epoch = next(param for param in original.params if param.name == "epoch0")
+    body = tirx.stmt_functor.substitute(original.body, {epoch: (epoch + 10) - 10})
+    kernel = D.compile(original.with_body(body), profile=D.P0A_PROFILE)
+    kernel.plan()
+    assert kernel._active_reference["proof"][1] <= MAX_EPOCH - 10
+    with pytest.raises(ValueError, match="integer overflow"):
+        kernel.plan(epoch_base=MAX_EPOCH - 2, epoch_end=MAX_EPOCH)
+
+
+def test_failed_plan_cannot_rebind_previous_build_specialization(monkeypatch, tmp_path):
+    from tvm import tirx
+
+    original = exchange(1, 1)
+    choice = tirx.Var("choice", "int32")
+    program = tirx.PrimFunc([*original.params, choice], original.body, buffer_map=original.buffer_map, attrs=original.attrs)
+    kernel = D.compile(program, profile=D.P0A_PROFILE)
+    first = kernel.plan(scalars={"choice": 0})
+    active = kernel._active_reference
+    funcs = kernel._funcs()
+    with pytest.raises(ValueError, match="positive and fit int32"):
+        kernel.plan(scalars={"choice": 1}, epoch_end=0)
+    assert kernel._active_reference is active
+    built = []
+    monkeypatch.setattr(tilelang, "compile", lambda func, **kwargs: built.append(func) or object())
+    kernel.build(shmem_root=fake_headers(tmp_path), plans=first)
+    assert all(actual.same_as(funcs[rank]) for rank, actual in enumerate(built))

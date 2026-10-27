@@ -189,8 +189,10 @@ def shmem_include_flags(shmem_root):
         raise ValueError("SHMEM_ROOT must contain complete SHMEM include/ and src/device/ headers: " + ", ".join(missing))
     paths = [root / "include", root / "src", root / "src/device", root / "src/device_simt"]
     digest = hashlib.sha256()
-    for path in sorted(root.rglob("*")):
-        if path.is_file() and path.suffix in {".h", ".hpp"} and any(path.is_relative_to(p) for p in paths):
+    # include/ and src/ contain every selected header. Avoid walking unrelated
+    # build/install trees, while preserving the exact path/content digest.
+    for path in sorted(path for tree in paths[:2] for path in tree.rglob("*")):
+        if path.is_file() and path.suffix in {".h", ".hpp"}:
             digest.update(str(path.relative_to(root)).encode())
             digest.update(path.read_bytes())
     # The backend binary cache includes compiler options, not transitive header

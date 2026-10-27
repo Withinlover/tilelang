@@ -2,7 +2,7 @@
 
 首次记录：2026 年 10 月 23 日；单 kernel 融合增补：2026 年 10 月 27 日。
 
-目标：当前仓库 Ascend 950 / AscendC；本文记录的验证全部在本机完成，未执行真实双卡。设计契约见 [P0 DSL 设计](distributed_p0_dsl.md)，Simulator 能力依据见[双卡仿真能力评估](cannsim_dual_rank_feasibility.md)。本机协议/CANN 流程见[联仿测试指南](../testing/distributed_p0.md)，新增原生路径的依赖、构建、启动与验收见[原生双卡测试指南](../testing/distributed_native.md)。
+目标：当前仓库 Ascend 950 / AscendC。第 2–10 节记录本机验证，未在本机执行真实双卡；第 11 节包含用户回传的服务器性能报告和后续 Host 排查，实机由用户执行。设计契约见 [P0 DSL 设计](distributed_p0_dsl.md)，Simulator 能力依据见[双卡仿真能力评估](cannsim_dual_rank_feasibility.md)。本机协议/CANN 流程见[联仿测试指南](../testing/distributed_p0.md)，新增原生路径的依赖、构建、启动与验收见[原生双卡测试指南](../testing/distributed_native.md)。
 
 ## 1. 交付范围
 
@@ -326,3 +326,76 @@ TILELANG_TEST_SHMEM_BRIDGE=1 python -m pytest -q \
 P0-A 交换＋本地 Cube 与 P0-B 融合，分别记录首次构建/执行、稳态和包含暂存/同步的
 端到端耗时。本机未执行真实双卡和性能测量。**多卡正确性、可见性、进度及性能继续
 保持“待实机验收”**，直到收到用户检查、脱敏的真实服务器结果。
+
+## 11. 首次服务器性能反馈与 Host 热路径排查（2026-10-27）
+
+用户回传了 performance 阶段的汇总：双 rank、BF16 64×64、3 轮、2 slots，
+3 次 warmup 后测量 20 次。HCCL、P0-A、P0-B 均报告 `passed=true`、
+`device_executed=true`、进程退出 0 且未超时。这是该性能 workload 的真实设备
+数值通过证据；报告未包含 commit/provenance，也未包含默认 13 个 device case 的
+完整验收结果，不能据此宣布全部多卡验收通过。
+
+| 模式 | execution 中位数 | execution p95 | 端到端中位数 |
+| --- | --- | --- | --- |
+| HCCL＋本地 TileLang | 0.264 ms | 6.181 ms | 0.373 ms |
+| P0-A 交换＋本地 Cube | 130.612 ms | 270.147 ms | 170.627 ms |
+| P0-B 融合 | 606.210 ms | 751.887 ms | 978.151 ms |
+
+这些是包含 Host 提交、预检与同步的 wall time，不是设备 kernel 的独立耗时。
+HCCL 一次批量 AllGather 三个 tile，P0 按三轮执行 READY/ACK slot 协议；输出计算
+任务相同，通信调用组织不同。HCCL 样本有明显长尾，表中 p95 按原始 20 个样本线性
+插值计算。原始较慢结果保留，不以移出预检/同步或更改计时边界消除差距。
+
+排查确认旧实现每次 prepare 和 launch 都重新调用融合 planner，每次又分别展开当前
+epoch、epoch 0、epoch 1 的两个 rank；GEMM 片段提取还被描述生成和缓存键计算重复
+触发。即使已经命中设备 kernel cache，这些 Host 工作仍被执行。SHMEM header
+指纹还先遍历整个源码目录（包含 build/install），再过滤实际 include/src 文件。
+
+本机保留真实 planner、头文件指纹、序列化和 ABI 检查，用测试 Bridge/Control 及
+空 kernel 隔离设备与网络后，20 次测量中位数如下：P0-A prepare 29.625 ms、execution
+56.971 ms、端到端 86.659 ms；P0-B 分别为 195.020、300.765、497.673 ms。
+五次 P0-B cProfile 共记录 1020 次 `extract_segment`（每 launch 204 次），占该
+profiling 时间约 2.287/3.745 秒；kernel 编译只在预构建时发生两次。这定位了可复现的
+Host 瓶颈，不能用本机数字代替服务器各阶段的实际耗时。
+
+后续修复缓存已验证的 scalar specialization、计划描述、GEMM 片段身份、两 rank
+PrimFunc 和编译键，分别限制缓存容量。返回给调用方的计划复制所有可变 Python 容器，
+build 检查成功计划的 token；失败的下一次计划不会更改前一次成功计划绑定的专化。
+跨 epoch 复用必须额外经过 IR 结构证明：epoch 只能平移信号值，且当前 base 落在
+每个 int32 加减中间值的安全闭区间内。epoch 相关的控制、地址、计算、未知 IR 或
+区间外情况继续逐 epoch 展开核查，不用 epoch 0/1 的抽样结果推断任意 epoch。
+
+每次 launch 仍验证 epoch 区间、regions、动态初始信号进度、Session 绑定和跨 rank
+一致性；源码、manifest、helper 和 SHMEM header 内容变化的诊断保留。header 指纹
+仅遍历参与原指纹的 include/src 子树，保持原路径排序和完整内容 hash。没有删除
+READY/ACK、DMA 完成、资源检查或同步，也没有引入“关闭校验”的性能模式。
+
+本轮本机回归为 **383 passed、0 skipped、6 deselected**；6 个代表用例的全新缓存
+SDK 编译全部通过（P0-A put/get/vector/hot-slot，P0-B GEMM/hot-slot），其两 rank
+共 **12 份生成的设备源码与上一版逐字一致**。监督/性能脚本单独回归为 30 passed。
+本轮未重跑 CANN 计算片段，也未执行真实设备；设备代码未变，新的 Host 快路径仍需
+服务器进行正确性回归和性能重测。
+
+性能报告 schema 2 保留旧 execution/e2e 边界，新增 prepare、staging、launch、complete、
+readback 等分段及 launch 内部规划、预检、缓存、提交、同步的嵌套归因，同时保留各
+rank 原始样本、p90/p95 和逐次独立数值误差。它不把 Host 提交/同步当成纯设备时间。
+运行命令和字段解释见[性能口径](../testing/distributed_fused.md#性能口径)。
+
+本轮产物保存在 `output/distributed/performance_followup_20261027/`，不随 Git 提交：
+`cpu/run_i9umbta1/`、`sdk/run_2u7i8x5m/`、`device-source-comparison.json` 与
+`harness-final.log`。初次 profiling 证据在 `output/distributed/performance_host_20261027/`。
+
+为校准前后比较，另用同一个脚本、同样的输入暂存/输出回读集合，在独立进程顺序加载
+`4c557232` 的原始 Host 模块和本轮模块，各测 3 次 warmup＋20 次稳态；期间没有并行
+运行编译或回归。两边都使用测试 Bridge/Control 和空 kernel，且仅预构建两次。
+
+| 本机隔离测量中位数 | 旧版 prepare → 修复后 | 旧版 execution → 修复后 | 旧版端到端 → 修复后 |
+| --- | --- | --- | --- |
+| P0-A | 30.292 → 1.212 ms | 57.137 → 6.609 ms | 87.520 → 7.961 ms |
+| P0-B | 195.752 → 1.698 ms | 299.164 → 7.644 ms | 494.989 → 9.591 ms |
+
+原始样本和脚本位于本轮目录的 `paired-host/`。这组“端到端”只指隔离实验中的
+prepare、输入暂存、launch/complete、Output 回读；没有真实设备、TCP 通信，亦未包含
+P0-A 的额外本地 GEMM。不能将约 39 倍的 P0-B Host execution 降幅当作服务器加速比。
+完整 header 内容校验和源码序列化等仍有毫秒级成本，尚未建立低延迟性能达标结论。
+下一轮必须保持原服务器口径重测，并根据新增分段定位剩余成本。

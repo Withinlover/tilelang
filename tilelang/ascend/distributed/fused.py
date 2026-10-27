@@ -6,6 +6,7 @@ owns its scratch until its synchronous completion; explicit regions connect
 acquire and release to the ordinary DMA dependency graph.
 """
 
+from collections import OrderedDict
 import functools
 import hashlib
 import inspect
@@ -141,6 +142,34 @@ def _normal_plan(plan, epoch_base):
             values[2] -= epoch_base
         result.append(tuple(values))
     return result
+
+
+def _clone_containers(value):
+    # TIR nodes and frozen Region/SignalRef values can be shared. Never expose
+    # mutable Python containers owned by a cached validation result.
+    if isinstance(value, dict):
+        return {key: _clone_containers(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_clone_containers(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_clone_containers(item) for item in value)
+    return value
+
+
+def _container_key(value):
+    if isinstance(value, dict):
+        return tuple(sorted((key, _container_key(item)) for key, item in value.items()))
+    if isinstance(value, (list, tuple)):
+        return tuple(_container_key(item) for item in value)
+    return value
+
+
+def _remember(cache, key, value, limit):
+    cache[key] = value
+    cache.move_to_end(key)
+    while len(cache) > limit:
+        cache.popitem(last=False)
+    return value
 
 
 def _description(instruction):
@@ -387,39 +416,113 @@ class FusedCompiledProgram(NativeCompiledProgram):
         self._manifest_digest = manifest_digest(self.manifest)
         self._base = 0
         self._normal_plans = None
+        self._reference_cache = OrderedDict()
+        self._expanded_cache = OrderedDict()
+        self._description_cache = OrderedDict()
+
+    def _description(self, instruction):
+        if instruction[0] not in ("gemm", "vector"):
+            return describe_instruction(instruction)
+        key = _container_key(instruction)
+        if key not in self._description_cache:
+            _remember(self._description_cache, key, describe_instruction(instruction), 128)
+        return _clone_containers(self._description_cache[key])
+
+    def _describe_plans(self, plans):
+        return {str(rank): [self._description(item) for item in plan] for rank, plan in plans.items()}
+
+    def _scalar_key(self, values):
+        from .plan import _integer
+
+        parameters = {param.name: param.dtype for param in self.prim_func.params if param not in self.prim_func.buffer_map}
+        if set(values) - parameters.keys() - {"epoch0"} or parameters.keys() - values.keys():
+            # Keep the shared planner's precise missing/extra-scalar diagnostic.
+            super()._expand_plans(values)
+        return tuple(sorted((name, _integer(value, parameters.get(name, "int32"))) for name, value in values.items()))
+
+    def _reference(self, values):
+        key = tuple((name, value) for name, value in self._scalar_key(values) if name != "epoch0")
+        if key in self._reference_cache:
+            self._reference_cache.move_to_end(key)
+            return self._reference_cache[key]
+        values = dict(values, epoch0=0)
+        reference = super()._expand_plans(values)
+        if not any(i[0] in ("local_copy", "gemm", "vector", "copy_async", "put_signal") for plan in reference.values() for i in plan):
+            fail("fused execution requires nonempty payload or local computation; skip zero work on the host")
+        if any(len(plan) > MAX_FUSED_INSTRUCTIONS for plan in reference.values()):
+            fail(f"fused static expansion supports at most {MAX_FUSED_INSTRUCTIONS} instructions per rank")
+        if self.profile == P0A_PROFILE and any(i[0] == "gemm" for p in reference.values() for i in p):
+            fail("P0-A is pure AIV; select P0-B for GEMM fusion")
+        if self.profile == P0B_PROFILE and any(i[0] == "vector" for p in reference.values() for i in p):
+            fail("P0-B currently supports copy/communication and fixed GEMM64; vector arithmetic uses P0-A")
+        descriptions = self._describe_plans(reference)
+        translated = super()._expand_plans(dict(values, epoch0=1))
+        if self._describe_plans({r: _normal_plan(p, 1) for r, p in translated.items()}) != descriptions:
+            fail("fused epoch0 may only translate signal epochs; epoch-dependent control, payload regions and computation are unsupported")
+        verify_fused_protocol(reference)
+        from .fused_epoch import prove_epoch_translation
+
+        proofs = [prove_epoch_translation(self.prim_func, scalars=dict(self._scalar_key(values)), rank=r) for r in (0, 1)]
+        interval = (
+            None
+            if any(proof is None for proof in proofs)
+            else (max(proof.min_base for proof in proofs), min(proof.max_base for proof in proofs))
+        )
+        entry = {"plans": reference, "descriptions": descriptions, "funcs": None, "keys": None, "proof": interval}
+        # A scalar specialization owns its TIR and kernels. Keep this working set
+        # bounded; an evicted specialization is rebuilt on its next use.
+        if len(self._reference_cache) == 4:
+            _, evicted = self._reference_cache.popitem(last=False)
+            for kernel_key in (evicted["keys"] or {}).values():
+                self._kernels.pop(kernel_key, None)
+        self._reference_cache[key] = entry
+        return entry
+
+    def _expand_plans(self, values):
+        entry = self._reference(values)
+        self._pending_reference = entry
+        key = self._scalar_key(values)
+        if key not in self._expanded_cache:
+            base = values["epoch0"]
+            interval = entry["proof"]
+            if interval is not None and interval[0] <= base <= interval[1]:
+                plans = {r: _normal_plan(plan, -base) for r, plan in entry["plans"].items()}
+            else:
+                # Unproven IR or a base outside the proof's intermediate-int32
+                # bounds must retain the complete per-epoch planner checks.
+                plans = super()._expand_plans(values)
+                normal = {r: _normal_plan(p, base) for r, p in plans.items()}
+                if self._describe_plans(normal) != entry["descriptions"]:
+                    fail(
+                        "fused epoch0 may only translate signal epochs; epoch-dependent control, payload regions and computation are unsupported"
+                    )
+            _remember(self._expanded_cache, key, plans, 8)
+        else:
+            self._expanded_cache.move_to_end(key)
+        return _clone_containers(self._expanded_cache[key])
 
     def plan(self, *, scalars=None, epoch_base=0, **kwargs):
         self._configs()  # Revalidate the bound device helper before any launch plan.
         plans = super().plan(scalars=scalars, epoch_base=epoch_base, **kwargs)
-        if not any(i[0] in ("local_copy", "gemm", "vector", "copy_async", "put_signal") for plan in plans.values() for i in plan):
-            fail("fused execution requires nonempty payload or local computation; skip zero work on the host")
-        if any(len(plan) > MAX_FUSED_INSTRUCTIONS for plan in plans.values()):
-            fail(f"fused static expansion supports at most {MAX_FUSED_INSTRUCTIONS} instructions per rank")
-        if self.profile == P0A_PROFILE and any(i[0] == "gemm" for p in plans.values() for i in p):
-            fail("P0-A is pure AIV; select P0-B for GEMM fusion")
-        if self.profile == P0B_PROFILE and any(i[0] == "vector" for p in plans.values() for i in p):
-            fail("P0-B currently supports copy/communication and fixed GEMM64; vector arithmetic uses P0-A")
-        values = dict(scalars or {})
-        values["epoch0"] = 0
-        reference = {r: self._plan_program(self.prim_func, rank=r, scalars=values, world_size=2)[0] for r in (0, 1)}
-        values["epoch0"] = 1
-        translated = {r: self._plan_program(self.prim_func, rank=r, scalars=values, world_size=2)[0] for r in (0, 1)}
-        if any([_description(i) for i in _normal_plan(translated[r], 1)] != [_description(i) for i in reference[r]] for r in (0, 1)):
-            fail("fused epoch0 may only translate signal epochs; epoch-dependent control, payload regions and computation are unsupported")
-        normal = {r: _normal_plan(p, epoch_base) for r, p in plans.items()}
-        if any([_description(i) for i in normal[r]] != [_description(i) for i in reference[r]] for r in (0, 1)):
-            fail("fused epoch0 may only translate signal epochs; epoch-dependent control, payload regions and computation are unsupported")
-        verify_fused_protocol(reference)
-        self._base, self._normal_plans = epoch_base, normal
+        # Publish this specialization only after every interval/ref/progress
+        # check succeeds. A failed plan must not switch a previous build token
+        # to a different scalar specialization.
+        self._active_reference = self._pending_reference
+        self._base = epoch_base
+        self._normal_plans = self._active_reference["plans"]
+        self._current_plan_token = _container_key(plans)
         return plans
 
     def _funcs(self):
-        return {
-            r: make_fused_prim_func(
-                self.prim_func, self.manifest["objects"], self._normal_plans[r], rank=r, mixed=self.profile == P0B_PROFILE
-            )
-            for r in (0, 1)
-        }
+        entry = self._active_reference
+        if entry["funcs"] is None:
+            entry["funcs"] = {
+                r: make_fused_prim_func(
+                    self.prim_func, self.manifest["objects"], entry["plans"][r], rank=r, mixed=self.profile == P0B_PROFILE
+                )
+                for r in (0, 1)
+            }
+        return dict(entry["funcs"])
 
     def _configs(self, shmem_root=None):
         if hashlib.sha256(self.helper_path.read_bytes()).hexdigest() != self.helper_fingerprint:
@@ -460,19 +563,28 @@ class FusedCompiledProgram(NativeCompiledProgram):
     def build(self, *, shmem_root, scalars=None, epochs=None, plans=None, output_dir=None):
         if plans is None:
             self.plan(scalars=scalars, epoch_end=epochs)
-        elif self._normal_plans is None or any(
-            [_description(i) for i in _normal_plan(plans[r], self._base)] != [_description(i) for i in self._normal_plans[r]]
-            for r in (0, 1)
-        ):
+        elif self._normal_plans is None or _container_key(plans) != self._current_plan_token:
             fail("fused build plans must come from this program's validated current plan")
+        self._configs()
+        if tvm.ir.save_json(self.prim_func) != self.ir_json or manifest_digest(self.manifest) != self._manifest_digest:
+            fail("compiled distributed source or execution manifest was modified")
         fingerprint = self._header_fingerprint(shmem_root)
         if self.header_fingerprint is not None and fingerprint != self.header_fingerprint:
             fail("SHMEM device headers changed after native compile; create a new compiled program and Session")
         artifacts = []
-        self._rank_keys = {}
+        entry = self._active_reference
+        identity = (fingerprint, self.compile_profile, self.transport_compile_profile)
+        if entry["keys"] is None or entry.get("build_identity") != identity:
+            for old_key in (entry["keys"] or {}).values():
+                self._kernels.pop(old_key, None)
+            entry["build_identity"] = identity
+            entry["keys"] = {
+                rank: ("fused", rank, _digest(tvm.ir.save_json(func)), fingerprint, self.compile_profile, self.transport_compile_profile)
+                for rank, func in self._funcs().items()
+            }
+        self._rank_keys = dict(entry["keys"])
         for rank, func in self._funcs().items():
-            key = ("fused", rank, _digest(tvm.ir.save_json(func)), fingerprint, self.compile_profile, self.transport_compile_profile)
-            self._rank_keys[rank] = key
+            key = self._rank_keys[rank]
             if key not in self._kernels:
                 self._kernels[key] = tilelang.compile(
                     func, target={"kind": "ascend", "arch": "dav-3510"}, execution_backend="tvm_ffi", pass_configs=self._configs(shmem_root)

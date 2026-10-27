@@ -1,16 +1,50 @@
 """Acceptance rejects partial device evidence and preserves real process failures."""
 
 from contextlib import suppress
+from copy import deepcopy
 import json
 import os
 from pathlib import Path
 import signal
 import sys
 import time
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
-from examples.distributed.run_p0_validation import CASES, assess_device, run_command
+from examples.distributed.run_p0_validation import CASES, assess_device, assess_performance, run_command
+
+
+def performance_evidence(iterations=2):
+    return {
+        "schema_version": 2,
+        "passed": True,
+        "device_executed": True,
+        "correctness_scope": "benchmark_workload_only",
+        "iterations": iterations,
+        "warmup": 1,
+        "ranks": [
+            {
+                "rank": rank,
+                "passed": True,
+                "device_executed": True,
+                "checks": [
+                    {"iteration": i, "passed": True, "mismatches": 0, "nonfinite": 0, "max_abs_error": 1e-7} for i in range(iterations + 1)
+                ],
+            }
+            for rank in range(2)
+        ],
+        **{
+            boundary: {
+                "median_seconds": value,
+                "p90_seconds": value,
+                "p95_seconds": value,
+                "count": iterations,
+                "samples_seconds": [value] * iterations,
+            }
+            for boundary, value in (("execution", 1.0), ("end_to_end", 2.0))
+        },
+    }
 
 
 @pytest.mark.parametrize("timed_out", [False, True])
@@ -21,12 +55,7 @@ def test_performance_deadline_overrides_successful_worker_summary(tmp_path, monk
         directory.mkdir(parents=True, exist_ok=True)
         runner.write_json(
             directory / "summary.json",
-            {
-                "passed": True,
-                "device_executed": True,
-                "execution": {"median_seconds": 1.0},
-                "end_to_end": {"median_seconds": 2.0},
-            },
+            performance_evidence(iterations=20),
         )
         # A launcher can finish normally at the deadline after writing output.
         return {"exit_code": 0, "timed_out": timed_out}
@@ -38,6 +67,166 @@ def test_performance_deadline_overrides_successful_worker_summary(tmp_path, monk
     assert report["passed"] is not timed_out
     assert ("performance_comparison" in report) is not timed_out
     assert report["device_acceptance"] == "not_run"
+
+
+@pytest.mark.parametrize("damage", ["missing_rank", "missing_check", "wrong_output", "wrong_scope", "missing_p95", "wrong_count"])
+def test_performance_rejects_incomplete_accuracy_or_timing(damage):
+    process = {"exit_code": 0, "timed_out": False}
+    summary = performance_evidence()
+    assert assess_performance(process, summary, iterations=2)["status"] == "passed"
+    if damage == "missing_rank":
+        summary["ranks"].pop()
+    elif damage == "missing_check":
+        summary["ranks"][1]["checks"].pop()
+    elif damage == "wrong_output":
+        summary["ranks"][1]["checks"][1].update(passed=False, mismatches=1)
+    elif damage == "wrong_scope":
+        summary["correctness_scope"] = "full_device_acceptance"
+    elif damage == "missing_p95":
+        del summary["execution"]["p95_seconds"]
+    else:
+        summary["end_to_end"]["samples_seconds"].pop()
+    assert assess_performance(process, summary, iterations=2)["status"] == "failed"
+
+
+def test_benchmark_pairs_iterations_before_percentiles_and_rejects_partial_ranks():
+    from examples.distributed.benchmark_p0 import paired_summary
+
+    reports = [
+        {
+            "rank": rank,
+            "timing_samples": [
+                {
+                    "iteration": iteration,
+                    "warmup": False,
+                    "execution_seconds": value,
+                    "end_to_end_seconds": value + 1,
+                    "stages_seconds": {"launch": value},
+                    "native_run_seconds": {"plan_validation": value / 2},
+                }
+                for iteration, value in enumerate(values)
+            ],
+        }
+        for rank, values in enumerate(([1.0, 100.0], [80.0, 2.0]))
+    ]
+    result = paired_summary(reports, iterations=2)
+    assert result["execution"]["samples_seconds"] == [80.0, 100.0]
+    assert result["execution"]["median_seconds"] == 90.0
+    assert result["execution"]["p90_seconds"] == 98.0
+    assert result["execution"]["p95_seconds"] == 99.0
+    assert result["stages"]["launch"]["median_seconds"] == 90.0
+    assert result["native_run"]["plan_validation"]["median_seconds"] == 45.0
+    reports[1]["timing_samples"].pop()
+    with pytest.raises(ValueError, match="incomplete steady-state"):
+        paired_summary(reports, iterations=2)
+
+
+@pytest.mark.parametrize("values", [[], [float("nan")], [-1.0]])
+def test_benchmark_rejects_invalid_timing_samples(values):
+    from examples.distributed.benchmark_p0 import describe_samples
+
+    with pytest.raises(ValueError, match="nonempty, finite and nonnegative"):
+        describe_samples(values)
+
+
+def test_benchmark_independent_oracle_records_wrong_or_nonfinite_elements():
+    import numpy as np
+
+    from examples.distributed.benchmark_p0 import check_output
+
+    # BF16 1.0 times BF16 1.0 sums to 64, independent of receive data.
+    a = np.full((2, 1, 64, 64), 0x3F80, dtype=np.uint16)
+    b = np.full((64, 64), 0x3F80, dtype=np.uint16)
+    output = np.full((1, 2, 64, 64), 64.0, dtype=np.float32)
+    assert check_output(output, a, b)["passed"]
+    output[0, 1, 0, 0] = 65.0
+    check = check_output(output, a, b)
+    assert not check["passed"] and check["mismatches"] == 1 and check["max_abs_error"] == 1.0
+    output[0, 1, 0, 0] = np.inf
+    check = check_output(output, a, b)
+    assert not check["passed"] and check["mismatches"] == check["nonfinite"] == 1
+
+
+@pytest.mark.parametrize("mode", ["hccl", "p0b"])
+def test_benchmark_main_preserves_timing_boundaries_and_nested_attribution(tmp_path, monkeypatch, mode):
+    import numpy as np
+    import torch
+    import torch.distributed as dist
+
+    from examples.distributed import benchmark_p0 as benchmark
+
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setitem(sys.modules, "torch_npu", ModuleType("torch_npu"))
+    monkeypatch.setattr(torch, "npu", SimpleNamespace(set_device=lambda _: None, synchronize=lambda _: None), raising=False)
+    original_empty, original_inputs = torch.empty, benchmark.make_inputs
+    inputs = {}
+
+    def make_inputs(rounds, seed):
+        inputs["a"], inputs["b"] = original_inputs(rounds, seed)
+        return inputs["a"], inputs["b"]
+
+    def reports(value):
+        return [{**deepcopy(value), "rank": rank} for rank in range(2)]
+
+    monkeypatch.setattr(benchmark, "make_inputs", make_inputs)
+    if mode == "hccl":
+        monkeypatch.setattr(torch, "empty", lambda *args, **kwargs: original_empty(*args, **{**kwargs, "device": "cpu"}))
+        monkeypatch.setattr(benchmark, "local_gemm", lambda: None)
+        monkeypatch.setattr(benchmark.tilelang, "compile", lambda *args, **kwargs: lambda a, b, c: c.copy_(a.float() @ b.float()))
+        monkeypatch.setattr(dist, "init_process_group", lambda *args, **kwargs: None)
+        monkeypatch.setattr(dist, "destroy_process_group", lambda: None)
+        monkeypatch.setattr(dist, "barrier", lambda: None)
+        monkeypatch.setattr(
+            dist,
+            "all_gather",
+            lambda buffers, source: [
+                buffer.copy_(torch.from_numpy(inputs["a"][rank].copy()).view(torch.bfloat16)) for rank, buffer in enumerate(buffers)
+            ],
+        )
+        monkeypatch.setattr(dist, "all_gather_object", lambda destination, value: destination.__setitem__(slice(None), reports(value)))
+    else:
+        compiled = SimpleNamespace(manifest={"objects": []}, build=lambda **kwargs: None)
+        monkeypatch.setattr(benchmark, "allgather_gemm", lambda *args: None)
+        for key, shape in (("Send", [3, 64, 64]), ("B", [64, 64]), ("Output", [3, 2, 64, 64])):
+            compiled.manifest["objects"].append(
+                dict(key=key, shape=shape, dtype="float32" if key == "Output" else "bfloat16", kind="symmetric", remote_access="read_write")
+            )
+
+        def copy_out(_):
+            a = (inputs["a"].astype(np.uint32) << 16).view(np.float32).astype(np.float64)
+            b = (inputs["b"].astype(np.uint32) << 16).view(np.float32).astype(np.float64)
+            return np.swapaxes(a @ b, 0, 1).astype(np.float32)
+
+        session = SimpleNamespace(preflight=lambda _: None, control=SimpleNamespace(all_gather=reports), copy_out=copy_out)
+        monkeypatch.setattr(benchmark.D, "compile", lambda *args, **kwargs: compiled)
+        monkeypatch.setattr(benchmark.D, "init", lambda **kwargs: session)
+        monkeypatch.setattr(benchmark.D, "alloc_symmetric", lambda *args, **kwargs: object())
+        monkeypatch.setattr(benchmark.D, "channel", lambda *args, **kwargs: object())
+        monkeypatch.setattr(benchmark.D, "prepare_launch", lambda *args, **kwargs: object())
+        monkeypatch.setattr(benchmark.D, "copy_in", lambda *args, **kwargs: None)
+        monkeypatch.setattr(benchmark.D, "launch", lambda *args, **kwargs: object())
+        monkeypatch.setattr(
+            benchmark.D,
+            "complete",
+            lambda _: {"physical_kernel_count": 1, "timing_basis": "host_wall", "timing_seconds": {"plan_validation": 1e-9}},
+        )
+        monkeypatch.setattr(benchmark.D, "close", lambda _: None)
+    assert benchmark.main(["--mode", mode, "--warmup", "1", "--iterations", "2", "--output-dir", str(tmp_path)]) == 0
+    summary = json.loads((tmp_path / "summary.json").read_text())
+    assert summary["correctness_scope"] == "benchmark_workload_only" and summary["full_device_acceptance"] == "not_assessed"
+    assert summary["execution"]["count"] == summary["end_to_end"]["count"] == 2
+    assert assess_performance({"exit_code": 0, "timed_out": False}, summary, iterations=2)["status"] == "passed"
+    for worker in summary["ranks"]:
+        assert len(worker["checks"]) == len(worker["timing_samples"]) == 3
+        for sample in worker["timing_samples"]:
+            stages = sample["stages_seconds"]
+            assert sum(stages.values()) == pytest.approx(sample["end_to_end_seconds"])
+            execution = sum(value for key, value in stages.items() if key not in {"prepare", "staging", "staging_sync", "readback"})
+            assert execution == pytest.approx(sample["execution_seconds"])
+            assert ("collective_submit" in stages) is (mode == "hccl")
+            assert ("launch" in stages) is (mode != "hccl")
+            assert bool(sample["native_run_seconds"]) is (mode != "hccl")
 
 
 def device_evidence(*, negative=False):

@@ -2,7 +2,7 @@
 
 统一入口为 [run_p0_validation.py](../../examples/distributed/run_p0_validation.py)。
 它分别记录 CPU 回归、真实 SDK 编译、真实双卡执行及性能，默认只运行 CPU 阶段。
-**在收到服务器报告前，多卡正确性、可见性、进度和性能均为“待实机验收”。**
+**完整设备矩阵仍须对应的服务器报告验收；性能用例通过只覆盖本次被测 workload。**
 编译成功、CPU 协议模型或单卡 Simulator 不能替代双卡测试。
 
 ## 支持范围
@@ -151,20 +151,63 @@ python -m examples.distributed.run_p0_validation \
   P0-A 本身没有 Cube，不能将此模式称为 P0-A GEMM 融合。
 - `p0b`：一个含通信与 GEMM 的 mixed kernel。
 
+这里的“相同”指相同数学结果、6 个 GEMM tile/rank 和每 peer 共 24 KiB 的逻辑有效载荷。
+HCCL 一次 `all_gather` 批量传输全部 3 轮，P0 每轮交换 8 KiB 并执行 READY/ACK，
+用 2 个接收 slot 复用存储；P0-A 还包含 Input→Source、Recv→Output 的本地搬运。
+因此该比较衡量当前三条完整实现的开销，不能把差值全部归因于通信 primitive 或融合技术。
+报告的 `workload.communication_schedule`、`payload_batches_per_peer`、`receive_slots`
+明确记录此差异。不得悄悄将 HCCL 改成逐轮调用后与旧批量结果混算；需要逐轮对照时应作为单独实验保留两种基线。
+
 每模式独立启动两个 worker；统一入口使用各 rank 独立的新 TileLang cache 目录。
 记录首次 build/cache load、首次执行、3 次 warmup 后 20 个稳态样本。
 这些是带同步的 **Host wall time**：`execution` 包含提交、分布式预检和必要同步，
 `end_to_end` 进一步包含每轮输入暂存、ticket 准备和输出回读。
-原始输入生成、独立 CPU oracle、初始化/分配与首次编译不计入稳态样本。
+原始输入生成、独立 CPU oracle、Session/设备缓冲初始化分配与首次编译不计入稳态样本。
+暂存和回读实际使用的 Host 临时对象、Host 复制与绑定校验保留在各自计时中。
 CPU 数值校验逐次执行；任一次失败即无有效性能通过。
 两个 rank 同序样本取较慢值，再报告中位数/min/max，不混用两个 rank 的局部最快值。
+同时保存样本数和 p90/p95，分位数按排序后 `(count - 1) × percentile` 位置线性插值；
+20 个样本的尾部分位数仍只是本次样本描述。保留各 rank 原始逐次样本，不用两个 rank
+各自的中位数相减或相加估计某个阶段。
 `performance_comparison` 的比值为 HCCL 中位数除以候选中位数，值大于 1 才表示相同口径更快。
+
+性能报告 schema 2 保留原 `execution`/`end_to_end` 的边界，并新增不改变协议与同步动作的分段：
+
+| `stages` 字段 | Host wall time 覆盖内容 |
+| --- | --- |
+| `prepare` | P0 ticket 准备，包含现有计划合法性验证和跨 rank 元数据检查 |
+| `staging` / `staging_sync` | 原输入暂存/搬入、必要的输入同步；包含各路径实际的 Host 检查和复制方式 |
+| `launch` | P0 `D.launch` 全部调用，包含验证、缓存检查、提交和内部完成等待 |
+| `complete` | P0 `D.complete`，包含 Session 完成同步及跨 rank 完成检查 |
+| `collective_submit` | HCCL `all_gather` 的完整 Host 调用；可能包含 Host 等待，不能当作纯提交延迟 |
+| `local_gemm_submit` | HCCL/P0-A 本地 GEMM 调用；P0-A 包含借用对称 GM view 的构造和释放 |
+| `final_sync` / `readback` | 原有最终设备同步和输出回读 |
+
+不适用的字段省略。每个 rank 的 `timing_samples` 保留含 warmup 的逐次分段，`stages` 汇总
+稳态样本。`native_run` 是 `launch` 内部的嵌套归因，包括 binding validation、plan validation、plan preflight、
+build/cache validation、build preflight、绑定与提交、stream sync 和 report finalize；
+其中 `total` 包含其子项，且整个 `native_run` 不在 `launch` 之外额外相加。
+每项的两 rank 最大值可能来自不同 rank，分段最大值或
+p95 不能相加还原整体时间。`outside_e2e_alignment_seconds` 记录原本就在计时边界外的
+轮次对齐及初始同步；数据生成和 CPU oracle 仍在边界外。
+
+上述分段仍是 Host wall time。`launch` 里的计划验证、IR/hash、跨 rank 元数据检查以及
+缓存身份检查都是当前 API 成本；不能把这些移出计时后称为端到端提速。
+分段计时自身的少量记录开销仍留在原边界内。没有在 Torch 默认 stream 上插入 event，
+因为 SHMEM 使用 Session 自有 stream；本报告不能提供纯 device kernel 延迟。
 
 直接运行 [benchmark_p0.py](../../examples/distributed/benchmark_p0.py) 时可能命中用户已有 cache，
 因此字段保留 `first_build_or_cache_load_seconds` 名称，不能无条件称为冷编译。
 这些入口不提供纯设备 event 延迟，也不凭 Host 计时证明通信与 Cube 实际重叠；
 需进一步判断重叠时应在服务器保存对应 profiler trace，再脱敏回传摘要。
 未实测前不承诺加速比。
+
+每次迭代（含 warmup）的独立 FP64 oracle 检查保存 `passed`、`elements`、`mismatches`、
+`nonfinite`、`max_abs_error` 和容差。两 rank 的结果与分段记录一并保存在性能 `summary.json`，
+缺 rank、缺迭代、数值失败、无效样本或超时均不通过。
+`correctness_scope=benchmark_workload_only`、`full_device_acceptance=not_assessed` 表示该报告
+只证明这些合成输入的本次性能 workload 正确；它没有替代 put/get、hot-slot、多 launch、
+快慢 rank 和负例的完整设备矩阵。统一入口的 `device_acceptance` 不会因性能阶段通过而改变。
 
 ## 结果和验收
 
@@ -191,7 +234,8 @@ TCPStore 的 loopback 与反向解析问题见[原生排障](distributed_native.
 请检查和脱敏后回传：commit/SHMEM revision、SDK 与 torch/torch_npu 版本、设备型号及逻辑拓扑、
 阶段/case/shape/dtype/rounds/slots/launches、各 rank 退出码、超时标记、错误类型与首条错误、
 每次 epoch 区间和最终 READY/ACK、数值误差与 mismatches、物理 kernel 数、负例检测结果、
-性能口径/样本数/中位数/min/max、skip 数及原因。无需回传机器地址、主机名、账号、
+性能口径/批量方式/样本数/中位数/min/max/p90/p95、各 rank 的 `stages` 和嵌套 `native_run`
+统计、逐次误差检查、skip 数及原因。无需回传机器地址、主机名、账号、
 生产数据、原始 profiler 或未检查的完整日志；路径可替换为相对 case 名。
 
 ## 调度与资源验证的准确边界

@@ -290,3 +290,33 @@ def test_native_local_copy_requires_disjoint_storage(destination):
             compiled.plan()
     else:
         assert compiled.plan()[0][0][0] == "local_copy"
+
+
+def test_shmem_fingerprint_traverses_only_header_subtrees_and_preserves_digest(tmp_path, monkeypatch):
+    import hashlib
+    from pathlib import Path
+    from tilelang.ascend.distributed.transport import shmem_include_flags
+
+    root = fake_headers(tmp_path)
+    (root / "src/device_simt").mkdir()
+    (root / "src/device_simt/extra.hpp").write_text("simt header")
+    (root / "build").mkdir()
+    (root / "build/ignored.hpp").write_text("not a selected include")
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob("*")):
+        if path.is_file() and path.suffix in {".h", ".hpp"} and any(path.is_relative_to(root / tree) for tree in ("include", "src")):
+            digest.update(str(path.relative_to(root)).encode())
+            digest.update(path.read_bytes())
+    expected = "-DTL_SHMEM_HEADER_DIGEST_" + digest.hexdigest() + "=1"
+    original = Path.rglob
+
+    def restricted(path, pattern):
+        assert path != root, "hot path must not enumerate build/install/repository objects"
+        return original(path, pattern)
+
+    monkeypatch.setattr(Path, "rglob", restricted)
+    assert shmem_include_flags(root)[-1] == expected
+    (root / "src/device_simt/extra.hpp").write_text("modified header")
+    assert shmem_include_flags(root)[-1] != expected
+    (root / "src/device_simt/extra.hpp").unlink()
+    assert shmem_include_flags(root)[-1] != expected

@@ -9,6 +9,7 @@ from contextlib import suppress
 from dataclasses import asdict, dataclass
 import importlib.metadata
 import json
+import math
 import os
 from pathlib import Path
 import signal
@@ -160,6 +161,57 @@ def assess_device(process, manifest, *, negative):
         and manifest.get("expected_negative_detected" if negative else "passed")
     )
     return {"status": "passed" if accepted else "failed", "device_executed": bool(executed), "negative_expected": negative}
+
+
+def assess_performance(process, summary, *, iterations):
+    """Performance checks certify this workload only, never the acceptance suite."""
+    workers = summary.get("ranks", [])
+    warmup = summary.get("warmup")
+    expected_checks = iterations + warmup if type(warmup) is int and warmup >= 0 else 0
+    executed = (
+        len(workers) == 2
+        and {worker.get("rank") for worker in workers} == {0, 1}
+        and all(worker.get("device_executed") for worker in workers)
+    )
+    checked = (
+        bool(expected_checks)
+        and executed
+        and all(
+            worker.get("passed")
+            and [check.get("iteration") for check in worker.get("checks", [])] == list(range(expected_checks))
+            and all(
+                check.get("passed") is True
+                and check.get("mismatches") == 0
+                and check.get("nonfinite") == 0
+                and isinstance(check.get("max_abs_error"), (int, float))
+                and math.isfinite(check["max_abs_error"])
+                for check in worker["checks"]
+            )
+            for worker in workers
+        )
+    )
+    timed = all(
+        summary.get(boundary, {}).get("count") == iterations
+        and len(summary.get(boundary, {}).get("samples_seconds", [])) == iterations
+        and all(isinstance(value, (int, float)) and math.isfinite(value) and value >= 0 for value in summary[boundary]["samples_seconds"])
+        and all(
+            isinstance(summary[boundary].get(key), (int, float)) and math.isfinite(summary[boundary][key]) and summary[boundary][key] > 0
+            for key in ("median_seconds", "p90_seconds", "p95_seconds")
+        )
+        for boundary in ("execution", "end_to_end")
+    )
+    accepted = (
+        process["exit_code"] == 0
+        and not process["timed_out"]
+        and summary.get("schema_version") == 2
+        and summary.get("correctness_scope") == "benchmark_workload_only"
+        and summary.get("passed") is True
+        and summary.get("device_executed") is True
+        and summary.get("iterations") == iterations
+        and checked
+        and timed
+    )
+    return {"status": "passed" if accepted else "failed", "device_executed": bool(executed), "correctness_scope": "benchmark_workload_only"}
 
 
 def case_command(args, case, stage, directory):
@@ -375,13 +427,7 @@ def main(argv=None):
                             "stage": stage,
                             "mode": mode,
                             "process": process,
-                            "status": "passed"
-                            if process["exit_code"] == 0
-                            and not process["timed_out"]
-                            and summary.get("passed")
-                            and summary.get("device_executed")
-                            else "failed",
-                            "device_executed": bool(summary.get("device_executed")),
+                            **assess_performance(process, summary, iterations=args.benchmark_iterations),
                             "summary": summary,
                         }
                     )
@@ -414,6 +460,11 @@ def main(argv=None):
                 for boundary in ("execution", "end_to_end")
             }
             report["performance_ratio_definition"] = "HCCL baseline median / candidate median; > 1 means lower candidate wall time"
+            report["performance_comparison_limit"] = (
+                "same mathematical workload and logical peer payload, different communication batching: "
+                "HCCL gathers all rounds in one collective; P0 uses per-round READY/ACK with bounded slots; "
+                "host validation remains included in execution and end_to_end"
+            )
         report["passed"] = all(result["status"] == "passed" for result in report["results"]) and bool(report["results"])
         devices = [result for result in report["results"] if result["stage"] == "device"]
         if devices:
