@@ -1,13 +1,15 @@
 # Ascend 分布式 JIT：共享对称堆与算子调用
 
-`tilelang.distributed.jit` 将现有原生分段执行包装成可调用算子。每个 rank
+`tilelang.distributed.jit` 将原生执行包装成可调用算子，默认仍选择 phased profile。每个 rank
 初始化一次 Session，Session 建立固定容量的 SHMEM 对称堆；每个绑定的算子特化
 从堆中取得自己的输入、输出、scratch 和信号空间。后续调用复用这些空间。
 
 该入口复用普通 TileLang 子 kernel 的编译和 `tvm_ffi` 执行路径。
-它没有新增融合计算或通信能力，当前仍限于同机两张 Ascend 950，通信和计算在
-同一 stream 上顺序执行。环境准备和底层能力边界见
-[原生双卡测试指南](distributed_native.md)。
+本页默认示例的通信和计算在同一 stream 上分 kernel 顺序执行。
+新增单 kernel 路径可显式设置 `D.jit(..., profile=D.P0A_PROFILE)` 或
+`D.P0B_PROFILE`，并绑定相同 profile 的 Session；输入/输出与生命周期约定不变。
+当前仍限于同机两张 Ascend 950。环境准备见[原生双卡测试指南](distributed_native.md)，
+新路径的受限算子范围、SDK 编译与真实设备验收见[融合路径验收](distributed_fused.md)。
 
 ## 调用接口
 

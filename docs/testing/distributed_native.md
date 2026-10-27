@@ -1,5 +1,8 @@
 # Ascend 950 原生双卡 P0 DSL 验证
 
+单 kernel P0-A/P0-B 的支持范围、统一分阶段验收与性能入口见
+[融合路径验收](distributed_fused.md)。本页保留 phased 路径作为可用基线。
+
 本指南对应 `feat/distributed-p0-dsl` 分支的新增 profile：`ascend950_shmem_mte_phased_v1`。
 入口是 [run_native_distributed.py](../../examples/distributed/run_native_distributed.py)。
 它从同一个 TD PrimFunc 生成两 rank 的顺序计划，将 TD 通信编译成真实 SHMEM MTE AIV kernel，
@@ -21,7 +24,7 @@
 | 本地计算 | 连续 GM copy；原始 BF16 64×64 GEMM，FP32 输出 |
 | 控制流 | `T.Kernel(1)`、可由 rank/Host 标量确定的 serial/条件；一个组和通道 |
 | 未支持 | 多机、超过两 rank、任意非连续区域、任意计算、PTO、Stage/Pipelined 通信、多发起核、graph replay |
-| 融合 | 通信与计算分 kernel 顺序执行；未实现原设计的单 kernel P0-A 和 P0-B 自动融合/重叠 |
+| 融合 | 本 profile 的通信与计算分 kernel 顺序执行；单 kernel 路径需显式选择 P0-A/P0-B profile |
 
 通信长度及起始字节偏移须为 32 的倍数。P0 信号仍为正 int32；950 的公开原子交换接口使用
 uint32 位视图，限定 `1..2^31-1` 后，SET 与 GE 比较和原 DSL 完全一致，无隐式截断。

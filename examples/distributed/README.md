@@ -1,6 +1,6 @@
 # P0 分布式 DSL 示例
 
-[example_allgather_gemm.py](example_allgather_gemm.py) 用同一个 TileLang PrimFunc 表达双 rank 的 READY/ACK 通信和本地/远端 GEMM。该源程序可进入本机联仿和新增的原生分段路径。
+[example_allgather_gemm.py](example_allgather_gemm.py) 用同一个 TileLang PrimFunc 表达双 rank 的 READY/ACK 通信和本地/远端 GEMM。该源程序可进入本机联仿、原生分段及 P0-B 单 kernel 融合路径。
 
 本机协议与 CANN 联仿见 [P0 分布式 DSL 测试指南](../../docs/testing/distributed_p0.md)；真实双卡的构建、启动、正反例及报告验收见 [Ascend 950 原生双卡测试指南](../../docs/testing/distributed_native.md)。接口与实现边界见 [设计文档](../../docs/design/distributed_p0_dsl.md) 和 [实现记录](../../docs/design/distributed_p0_implementation_validation.md)。
 
@@ -18,7 +18,9 @@ python examples/distributed/example_allgather_gemm.py \
 
 运行 CANN 模式前请完成测试指南中的工具与环境检查。产物以本次 `run_dir` 为准；保留全局 oracle、通信轨迹和片段流水，不只查看局部 GEMM 的精度结果。
 
-[run_native_distributed.py](run_native_distributed.py) 提供 `put`、`get` 和复用上述源 DSL 的 `gemm` 用例。原生 profile `ascend950_shmem_mte_phased_v1` 将通信降为 SHMEM AIV kernel，计算降为普通 TileLang kernel，复用 `tvm_ffi`；每 rank 独立进程绑定一张 Ascend 950，通信与计算在同一 stream 顺序执行。它不依赖 cannsim-helper，尚未实现单 kernel P0-A 或 P0-B 融合。
+[run_native_distributed.py](run_native_distributed.py) 提供 `put`、`get` 和复用上述源 DSL 的 `gemm` 用例。原生 profile `ascend950_shmem_mte_phased_v1` 将通信降为 SHMEM AIV kernel，计算降为普通 TileLang kernel，复用 `tvm_ffi`；每 rank 独立进程绑定一张 Ascend 950，通信与计算在同一 stream 顺序执行。它不依赖 cannsim-helper。该 phased profile 保留作为基线；新增 `--execution p0a/p0b` 分别选择 pure AIV 或 mixed 单 kernel 路径，真实多卡仍待实机验收。
+
+统一 CPU/SDK/真实双卡验收和性能入口为 [run_p0_validation.py](run_p0_validation.py)，支持按阶段和 case 重跑；完整命令、范围、报告字段见 [P0 融合验收指南](../../docs/testing/distributed_fused.md)。
 
 先在无设备环境检查同一程序的源码：
 

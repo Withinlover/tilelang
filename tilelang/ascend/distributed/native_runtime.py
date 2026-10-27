@@ -26,7 +26,15 @@ from urllib.parse import urlparse
 
 import numpy as np
 
-from tilelang.distributed.abi import MAX_EPOCH, NATIVE_PROFILE, SIGNAL_STRIDE_BYTES, canonical_manifest, kernel_manifest, manifest_digest
+from tilelang.distributed.abi import (
+    MAX_EPOCH,
+    NATIVE_PROFILE,
+    NATIVE_PROFILES,
+    SIGNAL_STRIDE_BYTES,
+    canonical_manifest,
+    kernel_manifest,
+    manifest_digest,
+)
 from tilelang.distributed.session import Channel, _contiguous_strides, _positive_int, _storage_dtype
 
 SHMEM_REVISION = "a232a76516c435cd39ecd10125fc6e14a55fc18b"
@@ -376,6 +384,7 @@ class NativeSession:
         rank,
         world_size,
         device,
+        profile=NATIVE_PROFILE,
         bootstrap,
         control,
         bridge,
@@ -386,7 +395,7 @@ class NativeSession:
     ):
         self._lock = RLock()
         self.rank, self.world_size, self.device = rank, world_size, device
-        self.profile, self.state = NATIVE_PROFILE, "INITIALIZING"
+        self.profile, self.state = profile, "INITIALIZING"
         self.control, self.bridge, self.timeout = control, bridge, timeout
         self.shmem_root, self.shmem_library = shmem_root, shmem_library
         self.abi_fingerprint = bridge.fingerprint
@@ -816,7 +825,7 @@ def init_runtime(
     control=None,
     bridge=None,
 ):
-    if profile != NATIVE_PROFILE or process_group is not None or world_size != 2:
+    if profile not in NATIVE_PROFILES or process_group is not None or world_size != 2:
         raise ValueError("native profile requires exactly two ranks and its own metadata control channel")
     rank = int(os.environ.get("RANK", "0")) if rank is None else rank
     device = int(os.environ.get("LOCAL_RANK", str(rank))) if device is None else device
@@ -843,6 +852,7 @@ def init_runtime(
             raise ValueError("set SHMEM_ROOT or pass shmem_root pointing to the pinned SHMEM source")
         bridge = ShmemBridge(shmem_root=shmem_root, shmem_library=shmem_library)
     return NativeSession(
+        profile=profile,
         rank=rank,
         world_size=world_size,
         device=device,

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .abi import NATIVE_PROFILE, encode_descriptor, kernel_manifest, manifest_digest
+from .abi import NATIVE_PROFILES, encode_descriptor, kernel_manifest, manifest_digest
 from .session import LaunchTicket, Session, SymmetricBuffer, UnsupportedProfileError, _check_ticket, _validate_manifest
 
 
@@ -29,7 +29,7 @@ class RunFailedError(RuntimeError):
 
 def launch(kernel, *, ticket, buffers=None, scalars=None, stream=None, **kwargs):
     ctx = ticket.session
-    if ctx.profile == NATIVE_PROFILE:
+    if ctx.profile in NATIVE_PROFILES:
         from tilelang.ascend.distributed.native import launch_native
 
         return launch_native(kernel, ticket=ticket, buffers=buffers, scalars=scalars, stream=stream, **kwargs)
@@ -90,7 +90,7 @@ def launch(kernel, *, ticket, buffers=None, scalars=None, stream=None, **kwargs)
 
 def complete(run):
     ctx = run.session
-    if ctx.profile == NATIVE_PROFILE:
+    if ctx.profile in NATIVE_PROFILES:
         from tilelang.ascend.distributed.native import complete_native
 
         return complete_native(run)

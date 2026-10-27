@@ -25,6 +25,7 @@ import tilelang.distributed as D
 import tilelang.language.distributed as TD
 
 from examples.distributed.example_allgather_gemm import TILE, allgather_gemm, global_accuracy, make_inputs
+from examples.distributed.example_fused_exchange import vector_exchange
 
 
 def exchange(rounds=3, slots=2, *, get=False):
@@ -75,6 +76,8 @@ def exchange(rounds=3, slots=2, *, get=False):
 
 
 def make_program(case, rounds, slots):
+    if case == "vector":
+        return vector_exchange(rounds, slots)
     return allgather_gemm(rounds, slots) if case == "gemm" else exchange(rounds, slots, get=case == "get")
 
 
@@ -87,10 +90,15 @@ def expected_signals(rounds, slots, base):
     return np.array([base + slot + 1 + (rounds - slot - 1) // slots * slots if slot < rounds else 0 for slot in range(slots)])
 
 
+def execution_profile(args):
+    execution = getattr(args, "execution", "phased")
+    return {"phased": D.NATIVE_PROFILE, "p0a": "ascend950_shmem_mte_p0a_v1", "p0b": "ascend950_shmem_mte_p0b_v1"}[execution]
+
+
 def compile_program(args, output):
     return D.compile(
         make_program(args.case, args.rounds, args.slots),
-        profile=D.NATIVE_PROFILE,
+        profile=execution_profile(args),
         mode="native",
         shmem_root=args.shmem_root,
         compile_profile="cann-9.1-gemm64" if args.sdk_profile == "cann-9.1" else "native",
@@ -107,9 +115,12 @@ def worker(args):
     report = {"rank": rank, "device": args.devices[rank], "completed": False, "launches": []}
     session = None
     try:
+        compile_started = time.perf_counter()
         compiled = compile_program(args, output / "kernels")
+        compiled.build(shmem_root=args.shmem_root, epochs=args.rounds, output_dir=output / "kernels")
+        report["first_build_seconds"] = time.perf_counter() - compile_started
         session = D.init(
-            profile=D.NATIVE_PROFILE,
+            profile=execution_profile(args),
             rank=rank,
             device=args.devices[rank],
             bootstrap=f"tcp://127.0.0.1:{args.bootstrap_port}",
@@ -128,9 +139,21 @@ def worker(args):
                 else D.alloc_symmetric(session, remote_access=spec["remote_access"], **common)
             )
         channel = D.channel(session, key="comm")
+        original_launch = session.launch_kernel
+        delay_pending = False
+
+        def delayed_launch(kernel, *values):
+            nonlocal delay_pending
+            if delay_pending and rank == args.delay_rank and args.rank_delay_ms:
+                time.sleep(args.rank_delay_ms / 1000.0)
+            delay_pending = False
+            return original_launch(kernel, *values)
+
+        session.launch_kernel = delayed_launch
         for launch in range(args.launches):
             inputs = np.load(root / f"launch{launch}_inputs.npz", allow_pickle=False)
             a, b = inputs["original_a"], inputs["original_b"]
+            end_to_end_started = time.perf_counter()
             ticket = D.prepare_launch(
                 session,
                 compiled,
@@ -143,16 +166,22 @@ def worker(args):
             if args.fault == "corrupt_send" and rank == 0 and launch == 0:
                 # Corrupt only the transmitted/source operand, preserving the
                 # parent's immutable original inputs for the global oracle.
-                send[0, 0, 0] = np.uint16(0x4080)  # BF16 4.0, outside generated input range.
+                # FP32 or BF16 4.0, outside the generated input range.
+                send[0, 0, 0] = np.float32(4.0) if args.case == "vector" else np.uint16(0x4080)
             D.copy_in(objects["Send" if args.case == "gemm" else "Input"], send, ticket=ticket)
             if args.case == "gemm":
                 D.copy_in(objects["B"], b, ticket=ticket)
             destination = objects["Output"]
             sentinel = (
-                np.full(destination.shape, np.nan, dtype="<f4") if args.case == "gemm" else np.full(destination.shape, 0xFFFF, dtype="<u2")
+                np.full(destination.shape, np.nan, dtype="<f4")
+                if args.case in ("gemm", "vector")
+                else np.full(destination.shape, 0xFFFF, dtype="<u2")
             )
             D.copy_in(destination, sentinel, ticket=ticket)
+            delay_pending = True
+            execution_started = time.perf_counter()
             execution = D.complete(D.launch(compiled, ticket=ticket))
+            execution_seconds = time.perf_counter() - execution_started
             actual = session.copy_out(destination)
             ready, ack = session.copy_out(objects["Ready"]), session.copy_out(objects["Ack"])
             np.save(output / f"launch{launch}_output.npy", actual)
@@ -162,6 +191,9 @@ def worker(args):
                 "epoch_base": ticket.base,
                 "epoch_end": ticket.end,
                 "execution": execution,
+                "execution_seconds": execution_seconds,
+                "validation_end_to_end_seconds": time.perf_counter() - end_to_end_started,
+                "injected_delay_ms": args.rank_delay_ms if rank == args.delay_rank else 0,
                 "ready": ready.tolist(),
                 "ack": ack.tolist(),
                 "expected_signals": expected.tolist(),
@@ -218,7 +250,7 @@ def check_accuracy(case, actual, a, b):
         if actual.dtype != np.dtype("<f4"):
             raise ValueError("native GEMM output must be float32")
         return global_accuracy(actual, a, b)
-    expected = a[::-1]
+    expected = a[::-1] * np.float32(2) if case == "vector" else a[::-1]
     if actual.shape != expected.shape or actual.dtype != expected.dtype:
         raise ValueError("native exchange output shape/dtype differs from the global input contract")
     mismatch = actual != expected
@@ -226,7 +258,7 @@ def check_accuracy(case, actual, a, b):
         "passed": bool(not mismatch.any()),
         "elements": int(actual.size),
         "mismatches": int(mismatch.sum()),
-        "reference": "bit-exact original BF16 input from peer",
+        "reference": "original FP32 peer input multiplied by two" if case == "vector" else "bit-exact original BF16 input from peer",
         "ranks": [{"rank": r, "passed": bool(not mismatch[r].any()), "mismatches": int(mismatch[r].sum())} for r in range(2)],
     }
 
@@ -244,11 +276,11 @@ def validate_outputs(root, args, worker_reports):
         if args.fault == "corrupt_send":
             injected = a.copy()
             if launch == 0:
-                injected[0, 0, 0, 0] = np.uint16(0x4080)
+                injected[0, 0, 0, 0] = np.float32(4.0) if args.case == "vector" else np.uint16(0x4080)
             faulty = check_accuracy(args.case, actual, injected, b)
             faulty.update(launch=launch, reference="independent oracle with the specified single source corruption")
             fault_accuracy.append(faulty)
-    compiled = D.compile(make_program(args.case, args.rounds, args.slots), profile=D.NATIVE_PROFILE)
+    compiled = D.compile(make_program(args.case, args.rounds, args.slots), profile=execution_profile(args))
     complete = len(worker_reports) == 2
     for rank, item in enumerate(worker_reports):
         complete = (
@@ -270,6 +302,9 @@ def validate_outputs(root, args, worker_reports):
                 complete and execution.get("rank") == rank and execution.get("epoch_base") == base and execution.get("epoch_end") == end
             )
             complete = complete and execution.get("phases_count") == len(phases) and execution.get("phases") == phases
+            if getattr(args, "execution", "phased") != "phased":
+                complete = complete and execution.get("physical_kernel_count") == 1
+                complete = complete and execution.get("execution") == f"native-single-kernel-{args.execution}"
     reference_passed = all(item["passed"] for item in accuracy)
     # The negative must complete all native phases and affect rank 1, which
     # consumes rank 0's remote operand; an unrelated crash is never accepted.
@@ -298,13 +333,18 @@ def supervise(args):
     print(f"Native output: {root}", flush=True)
     for launch in range(args.launches):
         a, b = make_inputs(args.rounds, args.seed + launch)
+        if args.case == "vector":
+            a = (a.astype(np.uint32) << 16).view(np.float32)
         np.savez(root / f"launch{launch}_inputs.npz", original_a=a, original_b=b)
     args.bootstrap_port = args.bootstrap_port or free_port()
     args.control_port = args.control_port or free_port()
     if args.bootstrap_port == args.control_port:
         raise ValueError("SHMEM bootstrap and control ports must differ")
     report = {
-        "profile": D.NATIVE_PROFILE,
+        "profile": execution_profile(args),
+        "execution_mode": args.execution,
+        "rank_delay_ms": args.rank_delay_ms,
+        "delay_rank": args.delay_rank,
         "case": args.case,
         "devices": args.devices,
         "fault": args.fault,
@@ -319,6 +359,12 @@ def supervise(args):
         "errors": [],
     }
     processes, logs = [], []
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def interrupted(signum, frame):
+        raise KeyboardInterrupt("validation supervisor received termination")
+
+    signal.signal(signal.SIGTERM, interrupted)
     try:
         for rank in range(2):
             command = [
@@ -331,6 +377,12 @@ def supervise(args):
                 str(rank),
                 "--case",
                 args.case,
+                "--execution",
+                args.execution,
+                "--rank-delay-ms",
+                str(args.rank_delay_ms),
+                "--delay-rank",
+                str(args.delay_rank),
                 "--rounds",
                 str(args.rounds),
                 "--slots",
@@ -376,9 +428,19 @@ def supervise(args):
         report["errors"].append(f"{type(error).__name__}: {error}")
     finally:
         stop_workers(processes)
+        signal.signal(signal.SIGTERM, previous_sigterm)
         for log in logs:
             log.close()
         report["rank_exit_codes"] = [process.returncode for process in processes]
+        if "workers" not in report:
+            report["workers"] = []
+            for rank in range(2):
+                path = root / f"rank{rank}/worker.json"
+                if path.is_file():
+                    try:
+                        report["workers"].append(json.loads(path.read_text()))
+                    except (OSError, ValueError) as error:
+                        report["errors"].append(f"rank {rank} report unavailable: {type(error).__name__}: {error}")
         write_json(root / "manifest.json", report)
     print(json.dumps({key: report[key] for key in ("passed", "report_complete", "expected_negative_detected", "errors")}), flush=True)
     return 0 if report["passed"] else (1 if report["expected_negative_detected"] else 2)
@@ -387,7 +449,12 @@ def supervise(args):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("lower", "build", "run"), default="lower")
-    parser.add_argument("--case", choices=("gemm", "put", "get"), default="gemm")
+    parser.add_argument("--case", choices=("gemm", "put", "get", "vector"), default="gemm")
+    parser.add_argument("--execution", choices=("phased", "p0a", "p0b"), default="phased")
+    parser.add_argument(
+        "--rank-delay-ms", type=float, default=0, help="Delay one rank after preflight, before its first device kernel per launch"
+    )
+    parser.add_argument("--delay-rank", type=int, choices=(0, 1), default=1)
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--slots", type=int, default=2)
     parser.add_argument("--launches", type=int, default=2)
@@ -408,6 +475,14 @@ def main(argv=None):
         parser.error("rounds, slots and launches must be in 1..10000; seed must be nonnegative")
     if len(set(args.devices)) != 2 or min(args.devices) < 0:
         parser.error("select two different nonnegative device IDs")
+    if not np.isfinite(args.rank_delay_ms) or args.rank_delay_ms < 0:
+        parser.error("rank-delay-ms must be finite and nonnegative")
+    if args.case == "vector" and args.execution != "p0a":
+        parser.error("vector requires --execution p0a")
+    if args.execution == "p0a" and args.case == "gemm":
+        parser.error("P0-A has no Cube GEMM; use --execution p0b or phased")
+    if args.execution == "p0b" and args.case != "gemm":
+        parser.error("P0-B validation uses the fixed AllGather + GEMM program")
     if args.operation_timeout <= 0 or args.timeout <= 0:
         parser.error("timeouts must be positive")
     if args.mode != "lower" and not args.shmem_root:

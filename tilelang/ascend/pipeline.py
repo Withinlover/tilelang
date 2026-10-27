@@ -54,6 +54,9 @@ def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     )(mod)
     pass_ctx = tilelang.transform.get_pass_context()
     auto_schedule_enabled = allow_autoschedule(pass_ctx=pass_ctx)
+    from tilelang.ascend.distributed.fusion_checks import verify_fused_inventory, verify_fused_storage, verify_fused_tasks
+
+    distributed_tasks = verify_fused_tasks(mod, auto_schedule=auto_schedule_enabled)
     disable_reuse = should_disable_shared_memory_reuse(pass_ctx=pass_ctx)
 
     if should_force_let_inline(pass_ctx=pass_ctx):
@@ -115,6 +118,9 @@ def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
         mod = ascend_transform.ResolveCore()(mod)
         mod = ascend_transform.InsertSync()(mod)
         mod = ascend_transform.MaterializeMultiBuffer()(mod)
+        if distributed_tasks:
+            verify_fused_tasks(mod)
+            verify_fused_inventory(mod, distributed_tasks, structured=True)
         mod = ascend_transform.LowerScheduledTIR()(mod)
         mod = ascend_transform.RestoreWhileLoops()(mod)
 
@@ -187,6 +193,9 @@ def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.MakePackedAPI()(mod)
     mod = tilelang.transform.Simplify()(mod)
     mod = tilelang.transform.LowerDeviceKernelLaunch()(mod)
+    if distributed_tasks:
+        verify_fused_inventory(mod, distributed_tasks)
+        verify_fused_storage(mod)
     return mod
 
 

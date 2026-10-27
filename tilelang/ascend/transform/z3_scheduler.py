@@ -192,7 +192,8 @@ def z3_schedule_python(
     # Check satisfiability
     if verbose:
         print("[Python Z3] Checking satisfiability...")
-    if solver.check() == z3.sat:
+    result = solver.check()
+    if result == z3.sat:
         model = solver.model()
 
         # Extract start times
@@ -221,7 +222,8 @@ def z3_schedule_python(
 
         return start_times, task_indices
     else:
-        raise RuntimeError("Z3 scheduling failed: solver returned unsat")
+        detail = f" ({solver.reason_unknown()})" if result == z3.unknown else ""
+        raise RuntimeError(f"Z3 scheduling failed: solver returned {result}{detail}")
 
 
 # FFI-exposed function that matches C++ interface

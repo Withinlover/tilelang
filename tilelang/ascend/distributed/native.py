@@ -44,6 +44,13 @@ def _segment_key(instruction):
 def describe_instruction(instruction):
     """Address-free evidence for a concrete rank/epoch plan."""
     kind, *args = instruction
+    if kind == "vector":
+        return {
+            "op": kind,
+            "inputs": [asdict(x) for x in args[0]],
+            "output": asdict(args[1]),
+            "body_sha256": [_digest(tvm.ir.save_json(x)) for x in args[2]],
+        }
     if kind == "gemm":
         return {"op": kind, "inputs": [asdict(x) for x in args[0]], "output": asdict(args[1]), "segment_sha256": _segment_key(instruction)}
 
@@ -124,6 +131,8 @@ class NativeCompiledProgram:
         self._manifest_digest = manifest_digest(self.manifest)
         self._kernels = {}
 
+    _plan_program = staticmethod(plan_program)
+
     @staticmethod
     def _header_fingerprint(shmem_root):
         from .transport import shmem_include_flags
@@ -143,7 +152,7 @@ class NativeCompiledProgram:
         values.setdefault("epoch0", epoch_base)
         plans = {}
         for rank in range(2):
-            plans[rank], _ = plan_program(self.prim_func, rank=rank, scalars=values, world_size=2)
+            plans[rank], _ = self._plan_program(self.prim_func, rank=rank, scalars=values, world_size=2)
         published = [
             instruction[5] if instruction[0] == "put_signal" else instruction[2]
             for plan in plans.values()
@@ -173,7 +182,7 @@ class NativeCompiledProgram:
                         fail(f"wait epoch {args[1]} is outside the prepared native interval")
                 elif kind == "local_copy":
                     refs.extend(args)
-                elif kind == "gemm":
+                elif kind in ("gemm", "vector"):
                     refs.extend([*args[0], args[1]])
                 for ref in refs:
                     self._validate_ref(ref)
@@ -438,54 +447,14 @@ class NativeCompiledProgram:
             "device_executed": False,
             "kernel_executed": False,
             "completed": False,
-            "execution": "native-sequential-host-phases",
+            "execution": self.manifest["execution"],
             "transport_abi": session.abi_fingerprint,
             "phases": [],
             "errors": [],
         }
 
-        def data_view(region, *, tile=False):
-            spec = self._specs[region.key]
-            byte_offset = region.offset * tvm.DataType(spec["dtype"]).bits // 8
-            if tile:
-                return bound[region.key].view(shape=(64, 64), byte_offset=byte_offset)
-            nbytes = region.count * tvm.DataType(spec["dtype"]).bits // 8
-            return bound[region.key].view(shape=(nbytes,), dtype="uint8", byte_offset=byte_offset)
-
-        def signal_view(ref):
-            return bound[ref.key].view(shape=(16,), dtype="uint32", byte_offset=ref.index * 64)
-
         try:
-            for index, instruction in enumerate(plans[session.rank]):
-                kind, *args = instruction
-                spec = self._transport_spec(instruction, session.rank)
-                if spec is not None:
-                    op, nbytes = spec
-                    kernel = self._kernels[("transport", op, nbytes, self.header_fingerprint, self.transport_compile_profile)]
-                    if kind in ("copy_async", "put_signal"):
-                        source, destination = args[1:3]
-                        peer = destination.rank if source.rank == session.rank else source.rank
-                        values = [data_view(destination), data_view(source), peer]
-                        if kind == "put_signal":
-                            values.extend([signal_view(args[3]), args[4]])
-                    elif kind == "signal":
-                        values = [signal_view(args[0]), args[0].rank, args[1]]
-                    elif kind == "wait_signal":
-                        values = [signal_view(args[0]), args[1]]
-                    elif kind == "local_copy":
-                        values = [data_view(args[1]), data_view(args[0]), session.rank]
-                    session.launch_kernel(kernel, *values)
-                    del values
-                    report["device_executed"] = report["kernel_executed"] = True
-                elif kind == "gemm":
-                    kernel = self._kernels[("gemm", _segment_key(instruction), self.compile_profile)]
-                    values = [data_view(region, tile=True) for region in (*args[0], args[1])]
-                    session.launch_kernel(kernel, *values)
-                    del values
-                    report["device_executed"] = report["kernel_executed"] = True
-                elif kind not in ("wait", "fence", "quiet"):
-                    fail(f"unhandled native phase {kind}")
-                report["phases"].append({"index": index, "op": kind})
+            self._execute(plans, session, bound, report)
             session.synchronize()
             if binding is not None:
                 signals = self._check_progress(plans, ticket.base, initial_signals=binding.signal_values)
@@ -499,6 +468,49 @@ class NativeCompiledProgram:
             if directory is not None:
                 _json(directory / "manifest.json", report)
         return report
+
+    def _execute(self, plans, session, bound, report):
+        def data_view(region, *, tile=False):
+            spec = self._specs[region.key]
+            byte_offset = region.offset * tvm.DataType(spec["dtype"]).bits // 8
+            if tile:
+                return bound[region.key].view(shape=(64, 64), byte_offset=byte_offset)
+            nbytes = region.count * tvm.DataType(spec["dtype"]).bits // 8
+            return bound[region.key].view(shape=(nbytes,), dtype="uint8", byte_offset=byte_offset)
+
+        def signal_view(ref):
+            return bound[ref.key].view(shape=(16,), dtype="uint32", byte_offset=ref.index * 64)
+
+        for index, instruction in enumerate(plans[session.rank]):
+            kind, *args = instruction
+            spec = self._transport_spec(instruction, session.rank)
+            if spec is not None:
+                op, nbytes = spec
+                kernel = self._kernels[("transport", op, nbytes, self.header_fingerprint, self.transport_compile_profile)]
+                if kind in ("copy_async", "put_signal"):
+                    source, destination = args[1:3]
+                    peer = destination.rank if source.rank == session.rank else source.rank
+                    values = [data_view(destination), data_view(source), peer]
+                    if kind == "put_signal":
+                        values.extend([signal_view(args[3]), args[4]])
+                elif kind == "signal":
+                    values = [signal_view(args[0]), args[0].rank, args[1]]
+                elif kind == "wait_signal":
+                    values = [signal_view(args[0]), args[1]]
+                elif kind == "local_copy":
+                    values = [data_view(args[1]), data_view(args[0]), session.rank]
+                session.launch_kernel(kernel, *values)
+                del values
+                report["device_executed"] = report["kernel_executed"] = True
+            elif kind == "gemm":
+                kernel = self._kernels[("gemm", _segment_key(instruction), self.compile_profile)]
+                values = [data_view(region, tile=True) for region in (*args[0], args[1])]
+                session.launch_kernel(kernel, *values)
+                del values
+                report["device_executed"] = report["kernel_executed"] = True
+            elif kind not in ("wait", "fence", "quiet"):
+                fail(f"unhandled native phase {kind}")
+            report["phases"].append({"index": index, "op": kind})
 
 
 def compile_program(program, **kwargs):

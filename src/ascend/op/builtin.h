@@ -31,6 +31,16 @@ static constexpr const char *kAscendSDKCompatibility =
 TVM_DLL const Op &conflict_hint();
 
 /*!
+ * \brief Synchronous AIV0 SHMEM task with explicit scheduling effects.
+ *
+ * Args: kind, dst, src, signal, scratch, nbytes, peer, epoch, then zero or
+ * more access_ptr operands describing acquire/release regions. Every call
+ * drains its MTE work before returning; trailing operands are effects only.
+ * The 4096-byte scratch and hard-event slot 7 belong to this task family.
+ */
+TVM_DLL const Op &ascend_distributed_task();
+
+/*!
  * \brief Ascend pipeline barrier intrinsic.
  *
  * ascend_pipe_barrier(pipe_t_string)

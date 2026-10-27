@@ -40,17 +40,20 @@ def test_native_examples_plan_both_ranks_without_helper(case):
 
 
 def _results(tmp_path, case, *, fault="none", corrupt=False):
-    args = SimpleNamespace(case=case, rounds=3, slots=2, launches=2, fault=fault)
-    compiled = D.compile(make_program(case, 3, 2), profile=D.NATIVE_PROFILE)
+    execution = "p0a" if case == "vector" else "phased"
+    args = SimpleNamespace(case=case, execution=execution, rounds=3, slots=2, launches=2, fault=fault)
+    compiled = D.compile(make_program(case, 3, 2), profile="ascend950_shmem_mte_p0a_v1" if case == "vector" else D.NATIVE_PROFILE)
     reports = [{"rank": rank, "completed": True, "closed": True, "launches": []} for rank in range(2)]
     for rank in range(2):
         (tmp_path / f"rank{rank}").mkdir()
     for launch in range(2):
         a, b = make_inputs(3, launch)
+        if case == "vector":
+            a = (a.astype(np.uint32) << 16).view(np.float32)
         np.savez(tmp_path / f"launch{launch}_inputs.npz", original_a=a, original_b=b)
         if corrupt and launch == 0:
             a = a.copy()
-            a[0, 0, 0, 0] = np.uint16(0x4080)
+            a[0, 0, 0, 0] = np.float32(4.0) if case == "vector" else np.uint16(0x4080)
         if case == "gemm":
 
             def decode(value):
@@ -60,6 +63,8 @@ def _results(tmp_path, case, *, fault="none", corrupt=False):
             outputs = [expected.copy(), expected.copy()]
         else:
             outputs = [a[1].copy(), a[0].copy()]
+            if case == "vector":
+                outputs = [value * np.float32(2) for value in outputs]
         for rank, actual in enumerate(outputs):
             np.save(tmp_path / f"rank{rank}/launch{launch}_output.npy", actual)
             plan = compiled.plan(epoch_base=launch * 3, epoch_end=(launch + 1) * 3)[rank]
@@ -78,6 +83,8 @@ def _results(tmp_path, case, *, fault="none", corrupt=False):
                         "rank": rank,
                         "epoch_base": launch * 3,
                         "epoch_end": (launch + 1) * 3,
+                        "execution": "native-single-kernel-p0a" if case == "vector" else "native-sequential-host-phases",
+                        "physical_kernel_count": 1 if case == "vector" else len(phases),
                         "phases_count": len(phases),
                         "phases": phases,
                     },
@@ -86,7 +93,7 @@ def _results(tmp_path, case, *, fault="none", corrupt=False):
     return args, reports
 
 
-@pytest.mark.parametrize("case", ["gemm", "put", "get"])
+@pytest.mark.parametrize("case", ["gemm", "put", "get", "vector"])
 def test_global_oracle_accepts_correct_complete_native_outputs(tmp_path, case):
     args, reports = _results(tmp_path, case)
     result = validate_outputs(tmp_path, args, reports)
@@ -94,7 +101,7 @@ def test_global_oracle_accepts_correct_complete_native_outputs(tmp_path, case):
     assert not result["expected_negative_detected"]
 
 
-@pytest.mark.parametrize("case", ["gemm", "put", "get"])
+@pytest.mark.parametrize("case", ["gemm", "put", "get", "vector"])
 def test_negative_requires_remote_result_mismatch_and_completed_execution(tmp_path, case):
     args, reports = _results(tmp_path, case, fault="corrupt_send", corrupt=True)
     result = validate_outputs(tmp_path, args, reports)

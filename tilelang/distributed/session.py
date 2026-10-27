@@ -17,6 +17,7 @@ from .abi import (
     LOCAL_PROFILE,
     MAX_EPOCH,
     NATIVE_PROFILE,
+    NATIVE_PROFILES,
     SIGNAL_STRIDE_BYTES,
     canonical_manifest,
     encode_descriptor,
@@ -125,7 +126,7 @@ class Session:
 
 
 def init(*, process_group=None, device=None, profile=LOCAL_PROFILE, world_size=2, **options):
-    if profile == NATIVE_PROFILE:
+    if profile in NATIVE_PROFILES:
         from tilelang.ascend.distributed.native_runtime import init_runtime
 
         return init_runtime(profile=profile, process_group=process_group, device=device, world_size=world_size, **options)
@@ -169,13 +170,13 @@ def _allocate(ctx, *, key, shape, dtype, remote_access, kind):
 
 
 def alloc_symmetric(ctx, *, key, shape, dtype, remote_access="read_write"):
-    if ctx.profile == NATIVE_PROFILE:
+    if ctx.profile in NATIVE_PROFILES:
         return ctx.allocate(key=key, shape=shape, dtype=dtype, remote_access=remote_access, kind="symmetric")
     return _allocate(ctx, key=key, shape=shape, dtype=dtype, remote_access=remote_access, kind="symmetric")
 
 
 def alloc_signals(ctx, *, key, shape, dtype="int32"):
-    if ctx.profile == NATIVE_PROFILE:
+    if ctx.profile in NATIVE_PROFILES:
         return ctx.allocate(key=key, shape=shape, dtype=dtype, remote_access="write", kind="signal")
     if str(dtype) != "int32":
         raise UnsupportedProfileError("the local P0 profile freezes SignalValue to int32")
@@ -183,7 +184,7 @@ def alloc_signals(ctx, *, key, shape, dtype="int32"):
 
 
 def channel(ctx, *, key, peers=None):
-    if ctx.profile == NATIVE_PROFILE:
+    if ctx.profile in NATIVE_PROFILES:
         return ctx.channel(key=key, peers=peers)
     with ctx._lock:
         if ctx.state != "QUIESCENT":
@@ -247,7 +248,7 @@ def _validate_manifest(ctx, manifest, ch, objects=None):
 
 
 def prepare_launch(ctx, kernel, *, channel, epochs, protocol, parameters=None, binding=None):
-    if ctx.profile == NATIVE_PROFILE:
+    if ctx.profile in NATIVE_PROFILES:
         return ctx.prepare(kernel, channel=channel, epochs=epochs, protocol=protocol, parameters=parameters, binding=binding)
     if binding is not None:
         raise UnsupportedProfileError("program bindings currently require a native session")
@@ -299,7 +300,7 @@ def _check_ticket(ctx, ticket):
 
 def copy_in(buffer, value, *, ticket, rank=None, stream=None):
     ctx = buffer.session
-    if ctx.profile == NATIVE_PROFILE:
+    if ctx.profile in NATIVE_PROFILES:
         return ctx.copy_in(buffer, value, ticket=ticket, rank=rank, stream=stream)
     with ctx._lock:
         _check_ticket(ctx, ticket)
@@ -331,7 +332,7 @@ def copy_in(buffer, value, *, ticket, rank=None, stream=None):
 
 
 def close(ctx):
-    if ctx.profile == NATIVE_PROFILE:
+    if ctx.profile in NATIVE_PROFILES:
         return ctx.close()
     with ctx._lock:
         if ctx.state == "CLOSED":

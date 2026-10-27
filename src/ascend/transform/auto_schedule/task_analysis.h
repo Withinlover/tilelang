@@ -291,6 +291,10 @@ public:
 private:
   void VisitExpr_(const CallNode *op) final {
     usage_.pipe_mask |= GetAscendTaskPipeMask(ffi::GetRef<Call>(op));
+    if (op->op.same_as(ascend_distributed_task())) {
+      usage_.hbm_mask |= static_cast<uint16_t>(HbmPort::kAiv) |
+                         static_cast<uint16_t>(HbmPort::kStore);
+    }
     if (IsAscendCopyCall(op)) {
       AscendCopy copy_obj(op->args, op->annotations);
       const AscendCopyNode *copy = copy_obj.get();

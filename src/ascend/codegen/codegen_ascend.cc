@@ -565,6 +565,7 @@ void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
   bool has_vector_subcores = false;
   bool has_nd2nz_post_copy = false;
   bool has_cooperative_groups = false;
+  bool has_distributed = false;
   int vector_count = 2;
   tirx::PostOrderVisit(f->body, [&](const ffi::ObjectRef &n) {
     if (const auto *block = n.as<SBlockNode>()) {
@@ -603,6 +604,9 @@ void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
           call->op.same_as(tl::ascend_write_gm_bypass_dcache())) {
         has_gm_bypass_dcache_ = true;
       }
+      if (call->op.same_as(tl::ascend_distributed_task())) {
+        has_distributed = true;
+      }
       if (call->op.same_as(tl::rng_init())) {
         has_philox_rng_ = true;
       }
@@ -611,6 +615,11 @@ void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
       }
     }
   });
+
+  if (has_distributed && !has_distributed_included_) {
+    preamble_stream_ << "#include <tl_templates/ascend/distributed.h>\n";
+    has_distributed_included_ = true;
+  }
 
   // Conditionally include gemm.h when ascend_gemm_l1 is used
   if (has_gemm_l1_ && !has_gemm_l1_included_) {
@@ -1804,7 +1813,25 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     CodeGenC::VisitExpr_(op, os);
     return;
   }
-  if (op->op.same_as(tl::device_assert())) {
+  if (op->op.same_as(tl::ascend_distributed_task())) {
+    ICHECK_GE(op->args.size(), 8U)
+        << "ascend_distributed_task requires its complete device ABI";
+    int64_t kind = GetIntImmArg(op, 0, "ascend_distributed_task", "kind");
+    ICHECK_GE(kind, 0);
+    ICHECK_LE(kind, 5);
+    this->PrintIndent();
+    this->stream << "tl::distributed_task<" << kind << ">(";
+    const char *casts[] = {"(__gm__ uint8_t*)", "(__gm__ uint8_t*)",
+                           "(__gm__ uint32_t*)", "(__ubuf__ uint8_t*)"};
+    for (size_t i = 1; i < 8; ++i) {
+      if (i > 1)
+        this->stream << ", ";
+      if (i < 5)
+        this->stream << casts[i - 1];
+      this->stream << PrintExpr(op->args[i]);
+    }
+    this->stream << ");\n";
+  } else if (op->op.same_as(tl::device_assert())) {
     ICHECK_EQ(op->args.size(), 1)
         << "tl.device_assert expects exactly 1 argument (condition)";
     this->PrintIndent();

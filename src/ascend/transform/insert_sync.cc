@@ -1039,11 +1039,13 @@ private:
       for (size_t j = i + 1; j < child_sync_points.size(); ++j) {
         RecordReusablePairs(
             child_sync_points[i], child_sync_points[j], result.closure,
-            /*allow_cross_iter=*/true, /*allow_mixed_iter=*/false);
+            /*allow_cross_iter=*/true, /*allow_mixed_iter=*/false,
+            /*single_invocation=*/loop == nullptr);
       }
       RecordReusablePairs(child_sync_points[i], local_points, result.closure,
                           /*allow_cross_iter=*/false,
-                          /*allow_mixed_iter=*/false);
+                          /*allow_mixed_iter=*/false,
+                          /*single_invocation=*/loop == nullptr);
       result.visible_sync_points.insert(result.visible_sync_points.end(),
                                         child_sync_points[i].begin(),
                                         child_sync_points[i].end());
@@ -1052,7 +1054,8 @@ private:
     // Mixed same/cross-iteration reuse is checked only at the collection level
     // where both points still have the same ring context.
     RecordReusablePairs(local_points, local_points, result.closure,
-                        /*allow_cross_iter=*/false, /*allow_mixed_iter=*/true);
+                        /*allow_cross_iter=*/false, /*allow_mixed_iter=*/true,
+                        /*single_invocation=*/loop == nullptr);
     result.visible_sync_points.insert(result.visible_sync_points.end(),
                                       local_points.begin(), local_points.end());
     RecordLifetimeOrder(task_site_ids, loop, result.closure);
@@ -1631,7 +1634,7 @@ private:
 
   bool CanReuse(const VisibleSyncPoint &lhs, const VisibleSyncPoint &rhs,
                 const DepClosure &closure, bool allow_cross_iter,
-                bool allow_mixed_iter) const {
+                bool allow_mixed_iter, bool single_invocation) const {
     const SyncPoint &lhs_sync = sync_points_[lhs.sync_point_id];
     const SyncPoint &rhs_sync = sync_points_[rhs.sync_point_id];
     if (!site_registry_.UsesFlag(lhs_sync) ||
@@ -1691,7 +1694,17 @@ private:
       const DepEdge &rhs_edge = rhs_it->second;
       bool current_lhs_before;
       bool current_rhs_before;
-      if (!lhs_cross_iter) {
+      if (!lhs_cross_iter && single_invocation &&
+          lhs_sync.flag_loop == nullptr && rhs_sync.flag_loop == nullptr) {
+        // Root straight-line tasks execute once per kernel. There is no next
+        // iteration that could overwrite the reused flag. Require a real
+        // completion path from the old WAIT to the new SET; lexical issue
+        // order (especially MTE/FIX order) alone does not prove consumption.
+        current_lhs_before =
+            HasCompletionEdge(closure, lhs_edge.dst, rhs_edge.src);
+        current_rhs_before =
+            HasCompletionEdge(closure, rhs_edge.dst, lhs_edge.src);
+      } else if (!lhs_cross_iter) {
         current_lhs_before = closure.HasEdge(lhs_edge.dst, rhs_edge.src, 0) &&
                              closure.HasEdge(rhs_edge.dst, lhs_edge.src, 1);
         current_rhs_before = closure.HasEdge(rhs_edge.dst, lhs_edge.src, 0) &&
@@ -1742,13 +1755,14 @@ private:
   void RecordReusablePairs(const std::vector<VisibleSyncPoint> &lhs_points,
                            const std::vector<VisibleSyncPoint> &rhs_points,
                            const DepClosure &closure, bool allow_cross_iter,
-                           bool allow_mixed_iter) {
+                           bool allow_mixed_iter, bool single_invocation) {
     for (const VisibleSyncPoint &lhs_visible : lhs_points) {
       for (const VisibleSyncPoint &rhs_visible : rhs_points) {
         size_t lhs = lhs_visible.sync_point_id;
         size_t rhs = rhs_visible.sync_point_id;
-        if (lhs == rhs || !CanReuse(lhs_visible, rhs_visible, closure,
-                                    allow_cross_iter, allow_mixed_iter)) {
+        if (lhs == rhs ||
+            !CanReuse(lhs_visible, rhs_visible, closure, allow_cross_iter,
+                      allow_mixed_iter, single_invocation)) {
           continue;
         }
         reusable_pairs_.emplace(std::min(lhs, rhs), std::max(lhs, rhs));

@@ -25,6 +25,11 @@ TIR_DEFINE_TL_BUILTIN(conflict_hint)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kPure));
 
+TIR_DEFINE_TL_BUILTIN(ascend_distributed_task)
+    .set_num_inputs(-1)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
 // The T.simd.* ops are registered under a "tl.simd.<name>" prefix while their
 // accessors are simd_<name>, so they need a macro of their own; the neutral
 // TIR_DEFINE_TL_BUILTIN (op/builtin_registry.h) maps both names to the same

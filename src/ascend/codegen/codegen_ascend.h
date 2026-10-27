@@ -110,6 +110,7 @@ private:
   bool has_gemm_l0_{false};
   bool has_gemm_l1_{false};
   bool has_gemm_l1_included_{false};
+  bool has_distributed_included_{false};
   bool has_nd2nz_copy_{false};
   bool has_nd2nz_copy_included_{false};
   bool has_simd_ops_{false};

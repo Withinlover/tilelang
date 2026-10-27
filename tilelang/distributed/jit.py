@@ -15,7 +15,7 @@ from threading import RLock
 
 import numpy as np
 
-from .abi import MAX_EPOCH, NATIVE_PROFILE, kernel_manifest, manifest_digest
+from .abi import MAX_EPOCH, NATIVE_PROFILE, NATIVE_PROFILES, kernel_manifest, manifest_digest
 from .launch import complete, launch
 from .session import UnsupportedProfileError, _positive_int, _storage_dtype
 
@@ -139,10 +139,10 @@ class DistributedKernel:
         owns allocations until close; dropping this Python object does not free
         memory or resize the fixed symmetric heap.
         """
-        from tilelang.ascend.distributed.native import NativeCompiledProgram
+        from tilelang.distributed import compile as compile_native
         from tilelang.ascend.distributed.native_runtime import NativeSession
 
-        if not isinstance(session, NativeSession) or session.profile != NATIVE_PROFILE:
+        if not isinstance(session, NativeSession) or session.profile not in NATIVE_PROFILES:
             raise UnsupportedProfileError("D.jit.bind requires a native SHMEM Session")
         with session._lock:
             if session.state not in ("QUIESCENT", "LOCAL_DONE"):
@@ -159,7 +159,7 @@ class DistributedKernel:
                 options["shmem_root"] = root
                 with self._lock:
                     if root not in self._programs:
-                        self._programs[root] = NativeCompiledProgram(self.prim_func, **options)
+                        self._programs[root] = compile_native(self.prim_func, **options)
                     return self._programs[root]
 
             compiled = _collective_result(session, "compile", self._contract, compile_program)
@@ -264,11 +264,11 @@ def jit(func=None, *, inputs, outputs, epochs, profile=NATIVE_PROFILE, **compile
     Calling the decorated factory specializes it without allocating device
     memory. Call ``.bind(session)`` collectively to allocate persistent private
     workspace, then invoke the bound operator with NumPy inputs. Device kernels
-    compile lazily through the existing native phased/tvm_ffi path. Pass
+    compile lazily through the selected native profile and tvm_ffi path. Pass
     ``debug=True`` to retain source, build and per-launch diagnostics.
     """
-    if profile != NATIVE_PROFILE:
-        raise UnsupportedProfileError("D.jit currently supports only the native SHMEM phased profile")
+    if profile not in NATIVE_PROFILES:
+        raise UnsupportedProfileError("D.jit currently supports the native SHMEM profiles")
     options = {"profile": profile, "debug": False, **compile_options}
 
     def decorate(factory):

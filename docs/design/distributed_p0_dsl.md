@@ -4,9 +4,16 @@
 
 本机联仿的部署和测试见[分布式 P0 测试指南](../testing/distributed_p0.md)；新增原生路径的部署、构建与真实双卡启动见[原生双卡测试指南](../testing/distributed_native.md)。文中的本地产物路径仅标识历史验收记录，日志、输入和流水不随 Git 分发。
 
-状态：已实现并验证 **P0 DSL 的本机联仿路径**，并新增 **SHMEM 原生分段路径**。`ascend950_cannsim_v1` 执行 CPU 通信模型及可选 CANN 片段；`ascend950_shmem_mte_phased_v1` 将同一 TD 程序降为真实通信与计算子 kernel。原生分段路径已完成本机源码、SDK 编译和 Host ABI 检查，真实双卡正确性与可见性尚待用户实机验收。原设计的单 kernel P0-A 与 P0-B 调度仍是后续目标，详见第 14 节及[实现与验证记录](distributed_p0_implementation_validation.md)。
+状态（2026-10-27）：保留 **P0 DSL 本机联仿**和 **SHMEM 原生分段路径**，新增显式
+`ascend950_shmem_mte_p0a_v1` / `ascend950_shmem_mte_p0b_v1` 单 kernel 路径。
+P0-A 支持顺序 pure AIV 通信和受限 FP32 SIMD；P0-B 将同源通信与固定 GEMM64 接入
+AutoSchedule、InsertSync 和 MultiBuffer，限定一个 mixed block、唯一发起者 AIV0。
+本机检查及其边界见[实现与验证记录](distributed_p0_implementation_validation.md)；
+**真实多卡正确性、可见性、进度和性能均待实机验收**，不将 SDK 编译或局部仿真记为通过。
 
-原生执行目标：当前仓库的 Ascend 950 / AscendC 后端，复用 `tvm_ffi`。新增原生分段路径由 Host 提交独立的 SHMEM AIV 通信 kernel 和 TileLang Cube 计算 kernel，不通过 CPU 模型传输数据；完整分布式函数尚未融合成单个设备 kernel。以下单 kernel P0-A/P0-B 章节继续保留为目标规范。
+原生执行目标：当前仓库的 Ascend 950 / AscendC 后端，复用 `tvm_ffi`。phased profile
+由 Host 提交独立通信/计算 kernel；两个融合 profile 每 rank 提交一个设备 kernel，均不通过
+CPU 模型传输数据。以下章节保留原始语义和验收规范；首版实际支持边界以第 14.3 节为准。
 
 初始调研源码基线：`a2679e5c6d7523e63d6611f2012177a3a112df1f`。后续实现为当前工作区中的新增代码；下文的完整原生实现路线仍保留为目标规范。
 
@@ -754,4 +761,38 @@ API 和协议边界已在本文给出；以下是平台实证问题，不能靠�
 
 本机已经生成并实际编译同源 GEMM 的全部通信/计算子 kernel，经既有 `tvm_ffi` 导出包含设备代码的共享库；固定 SHMEM 库和使用真实 SDK 头文件的 Host bridge 也已构建。无设备测试覆盖计划、ABI、生命周期、错误诊断和独立结果验收；新增原生 put/get 的同一源 IR 还通过 CPU 协议模型验证 slot 复用、连续 launch、原始 peer 数据以及 lease/event 收尾。这些结果不包括真实 NPU 启动或跨卡内存可见性证明。
 
-依赖固定版本、编译与实机命令、输出字段和压力矩阵统一维护在[原生双卡测试指南](../testing/distributed_native.md)。原设计的单 kernel P0-A、P0-B 的 AutoSchedule/InsertSync/MultiBuffer 通信依赖与融合性能仍需后续实现和实机证据；本分段 profile 不改变这些交付门槛。
+依赖固定版本、编译与实机命令、输出字段和压力矩阵统一维护在[原生双卡测试指南](../testing/distributed_native.md)。本分段 profile 不改变单 kernel 交付门槛；新增融合实现见下一节，性能结论仍需实机证据。
+
+### 14.3 受限单 kernel P0-A/P0-B
+
+[fused.py](../../tilelang/ascend/distributed/fused.py) 复用 canonical TD、Session 和有限计划，
+将每个 rank 的通信与原始本地计算语句组成一个 PrimFunc。运行时只绑定有序对称对象及
+`int32 epoch0`，信号参数为物理 64 字节 stride 的视图；不将 CPU descriptor 当作设备地址表。
+rank/静态控制流在 Host 预检并特化，epoch 只能平移信号值。改变 payload 地址、计算或控制流的
+epoch 用法明确拒绝。程序、profile、SHMEM 头文件及融合 helper 内容进入身份和缓存契约。
+
+每个 `tl.ascend_distributed_task` 是 AIV0 上有完成语义的 Scalar 任务：SHMEM MTE 操作在
+task 返回前 quiet，显式访问指针携带 payload、signal、acquire covers、release regions 及
+scratch 效果。所有通信任务共享唯一 scratch 的读写依赖，保持单发起者协议顺序。
+acquire 对接收区的写效果建立 READY→MTE2 边；ACK 的 release 写效果与此前 DMA 读形成
+WAR 边，InsertSync 等待真正的 MTE2 完成。Cube 读取 L1 后的计算不再持有 GM slot 的租约。
+源事件仍通过校验；实现采用允许的更强通信完成，既不保留跨 task 悬空请求，也不取消尾部 ACK。
+
+两条路径均开启 AutoSchedule/InsertSync。P0-A 额外限制本地运算为经过检查的 FP32 SIMD
+GM↔UB 搬运和向量加法；P0-B 使用原始 BF16 64×64、FP32 累加/输出 GEMM。
+受限流水来自静态展开后两个核心的合法任务流；一般 `T.Pipelined`/`T.Stage` 通信仍不受支持。
+编译器能允许重叠不意味着硬件已经实现重叠或端到端加速。
+
+统一资源约束为一份 4096 字节通信 UB scratch，硬件 event 7 保留给 helper，其他本地 flags
+由原分配器使用剩余槽位或 spill。通信 scratch 不参与多版本化，融合函数的物理存储复用关闭，
+原本的依赖规划和 MultiBuffer 仍运行。检查在调度前、MultiBuffer 后和后段进行，保护通信
+动作身份/顺序、epoch、显式区域、scratch 独占及 event 保留。正常出口保留 drain。
+
+协议预检对支持的有限双 rank 计划检查冲突访问、READY/acquire、ACK/release、get 源租约及
+确定等待死锁；它依赖 transport 的完成/可见性契约，不是一般跨 rank 活性证明。
+仍拒绝超过两 rank、多通道、多发起核、动态数据 peer、非连续区域、未知 SIMD 操作、
+普通 GM/NPU Tensor 参数、一般 shape/dtype 和其他 transport。
+现有普通 `tilelang.compile/lower` 对原始 TD 的 gate 保留，入口为显式 `D.compile`/`D.jit` profile。
+
+统一部署、分阶段运行、负例、性能口径和脱敏回传字段见
+[融合路径验收](../testing/distributed_fused.md)。本机可执行结果单独记录，不替代服务器验收。

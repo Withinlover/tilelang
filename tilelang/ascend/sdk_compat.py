@@ -8,6 +8,10 @@ computation and they fail on an unfamiliar source shape before invoking Bisheng.
 def adapt_source(source, profile, arch):
     if arch != "dav-3510":
         raise ValueError(f"Ascend SDK compatibility {profile!r} requires dav-3510, got {arch!r}")
+    if profile == "cann-9.1-fused":
+        from .distributed.fused import adapt_cann91_fused
+
+        return adapt_cann91_fused(source)
     if profile == "cann-9.1-gemm64":
         from .distributed.segments import adapt_cann91_gemm64
 

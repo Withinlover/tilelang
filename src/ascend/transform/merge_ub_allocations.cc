@@ -22,6 +22,7 @@
  * \brief Merge Ascend on-chip allocations from a buffer-alias contract.
  */
 
+#include "ascend/op/builtin.h"
 #include "buffer_alias.h"
 #include "merge_ub_common.h"
 
@@ -479,9 +480,19 @@ Pass MergeUBAllocations(int align_bytes = 16, bool disable_reuse = false) {
         context
             ->GetConfig<Bool>(kDebugMergeSharedMemoryAllocations, Bool(false))
             .value();
+    bool has_distributed = false;
+    PostOrderVisit(func->body, [&](const ObjectRef &node) {
+      if (const auto *call = node.as<CallNode>())
+        has_distributed |= call->op.same_as(ascend_distributed_task());
+    });
+    // A SHMEM helper issues MTE2/MTE3 asynchronously inside one scalar task.
+    // Keep its scratch in an exclusive physical allocation, independently of
+    // generic scalar lifetime shortening or alias proofs. P0 intentionally
+    // trades local storage reuse for this auditable resource contract.
     PrimFuncNode *writer = func.CopyOnWrite();
-    writer->body = tl::MergeUBAllocations(std::move(writer->body), align_bytes,
-                                          verbose, disable_reuse);
+    writer->body =
+        tl::MergeUBAllocations(std::move(writer->body), align_bytes, verbose,
+                               disable_reuse || has_distributed);
     return func;
   };
   return CreatePrimFuncPass(pass_func, 0, "tl.MergeUBAllocations", {});

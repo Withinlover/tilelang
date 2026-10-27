@@ -277,7 +277,8 @@ inline uint16_t GetAscendCallPipeMask(const Call &call) {
     return PipeMask(GetConstantPipeArgument(call.get(), 1));
   }
 
-  if (op.same_as(ascend_set_copy_pad_value()) ||
+  if (op.same_as(ascend_distributed_task()) ||
+      op.same_as(ascend_set_copy_pad_value()) ||
       op.same_as(ascend_threadfence()) || op.same_as(ascend_set_hf32_mode()) ||
       op.same_as(ascend_set_mmad_direction()) ||
       op.same_as(ascend_set_atomic()) || op.same_as(ascend_set_atomic_none()) ||

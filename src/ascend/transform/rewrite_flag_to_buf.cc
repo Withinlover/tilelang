@@ -144,8 +144,10 @@ public:
   FlagCallRanges call_ranges;
   // Highest buf_id reserved by gemm_l1 + 1 (0 if no gemm_l1 present).
   int64_t reserved_hwm = 0;
+  bool has_distributed = false;
 
   void VisitExpr_(const CallNode *op) final {
+    has_distributed |= op->op.same_as(ascend_distributed_task());
     if (std::optional<std::string> he = GetFlagHardEvent(op)) {
       EventIdBounds range = EventIdRange(GetConstrSet(), *he, op->args[1]);
       call_ranges[op].push_back(range);
@@ -200,8 +202,7 @@ CoalesceBlocks(std::vector<std::pair<int64_t, int64_t>> ranges) {
 
 // 0/1 knapsack (capacity kFlagSlotsPerPair): pick the subset of blocks whose
 // total size is maximal but <= capacity. Returns a keep-flag per block.
-std::vector<bool> KnapsackKeep(const std::vector<Block> &blocks) {
-  const int cap = kFlagSlotsPerPair;
+std::vector<bool> KnapsackKeep(const std::vector<Block> &blocks, int cap) {
   int n = static_cast<int>(blocks.size());
   // parent[w] = index of the block added to first reach subset-sum w (-1 = the
   // empty base); prev_sum[w] = the sum before adding it.
@@ -312,6 +313,10 @@ PrimFunc RewriteFlagToBufFn(PrimFunc f) {
   collector(f->body);
   if (collector.order.empty())
     return f;
+  // Slot 7 is used inside the synchronous SHMEM transfer helper. Reserve it
+  // uniformly across hard-event pairs, including future helper implementations.
+  const int available_slots =
+      kFlagSlotsPerPair - static_cast<int>(collector.has_distributed);
 
   std::unordered_map<std::string, std::vector<BlockAssign>> assign;
   // Start spilled buf_id allocation past the slots gemm_l1 already reserves.
@@ -324,23 +329,23 @@ PrimFunc RewriteFlagToBufFn(PrimFunc f) {
     bool already_legal = true;
     for (const auto &b : blocks) {
       total += b.size();
-      already_legal &= b.hi < kFlagSlotsPerPair;
+      already_legal &= b.hi < available_slots;
     }
-    if (total <= kFlagSlotsPerPair && already_legal)
+    if (total <= available_slots && already_legal)
       continue; // Already fits in the physical flag namespace.
 
     // A sparse out-of-range layout that still fits in 8 slots only needs
     // compaction. Use knapsack selection only when capacity is truly exceeded.
-    std::vector<bool> kept = total <= kFlagSlotsPerPair
+    std::vector<bool> kept = total <= available_slots
                                  ? std::vector<bool>(blocks.size(), true)
-                                 : KnapsackKeep(blocks);
+                                 : KnapsackKeep(blocks, available_slots);
     std::vector<BlockAssign> he_assign;
     int flag_running = 0;
     for (size_t i = 0; i < blocks.size(); ++i) {
       const Block &b = blocks[i];
       if (kept[i]) {
         ICHECK_LE(static_cast<int64_t>(flag_running) + b.size(),
-                  static_cast<int64_t>(kFlagSlotsPerPair))
+                  static_cast<int64_t>(available_slots))
             << "RewriteFlagToBuf: compacted flag range exceeds [0,8) for '"
             << he << "'";
         he_assign.push_back(BlockAssign{b.lo, b.hi, true, flag_running - b.lo});
@@ -369,6 +374,17 @@ PrimFunc RewriteFlagToBufFn(PrimFunc f) {
   FlagToBufRewriter rewriter(std::move(assign),
                              std::move(collector.call_ranges));
   f.CopyOnWrite()->body = rewriter(f->body);
+  if (collector.has_distributed) {
+    FlagUsageCollector final_usage;
+    final_usage(f->body);
+    for (const auto &[event, ranges] : final_usage.ranges) {
+      for (const auto &[lo, hi] : ranges) {
+        ICHECK_LT(hi, available_slots)
+            << "Distributed SHMEM hard-event reservation was violated for "
+            << event;
+      }
+    }
+  }
   return f;
 }
 

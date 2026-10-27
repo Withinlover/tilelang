@@ -14,6 +14,9 @@ import numpy as np
 
 LOCAL_PROFILE = "ascend950_cannsim_v1"
 NATIVE_PROFILE = "ascend950_shmem_mte_phased_v1"
+P0A_PROFILE = "ascend950_shmem_mte_p0a_v1"
+P0B_PROFILE = "ascend950_shmem_mte_p0b_v1"
+NATIVE_PROFILES = frozenset({NATIVE_PROFILE, P0A_PROFILE, P0B_PROFILE})
 MANIFEST_ATTR = "tl.distributed.manifest"
 DESCRIPTOR_HEADER_BYTES = 64
 DESCRIPTOR_RECORD_BYTES = 32

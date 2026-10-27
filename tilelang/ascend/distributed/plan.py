@@ -103,7 +103,7 @@ class SignalRef:
     index: int
 
 
-def plan_program(program, *, rank, scalars, world_size):
+def plan_program(program, *, rank, scalars, world_size, allow_vector=False):
     check_distributed(program)
     if isinstance(rank, bool) or not isinstance(rank, int) or not 0 <= rank < world_size:
         fail("rank must be inside the static group")
@@ -171,11 +171,14 @@ def plan_program(program, *, rank, scalars, world_size):
         else:
             inputs = []
             for item in local:
-                if "copy" in op_name(item.value):
+                if isinstance(item, tirx.Evaluate) and "copy" in op_name(item.value):
                     candidate = tile_region(item.value.args[0])
                     if candidate.buffer.scope() == "global":
                         inputs.append(candidate)
-            if len(inputs) != 2 or not any(op_name(item.value) == "tl.tileop.gemm" for item in local):
+            has_gemm = any(isinstance(item, tirx.Evaluate) and op_name(item.value) == "tl.tileop.gemm" for item in local)
+            if not has_gemm and not allow_vector:
+                fail("local GEMM phase requires exactly two explicit GM inputs and one GM output")
+            if has_gemm and len(inputs) != 2:
                 fail("local GEMM phase requires exactly two explicit GM inputs and one GM output")
             # Substitute launch/loop scalars before extraction. The segment
             # compiler consumes these exact operations, not a canned GEMM.
@@ -192,10 +195,15 @@ def plan_program(program, *, rank, scalars, world_size):
 
             # Validate every local phase before the first protocol event,
             # including in protocol-only mode.
-            extract_segment(body, list(allocations), [fixed(x) for x in inputs], fixed(dst), annotations=dict(block_annotations))
+            if has_gemm:
+                extract_segment(body, list(allocations), [fixed(x) for x in inputs], fixed(dst), annotations=dict(block_annotations))
+            else:
+                from .fused import validate_vector_phase
+
+                validate_vector_phase(body, list(allocations), [fixed(x) for x in inputs], fixed(dst))
             plan.append(
                 (
-                    "gemm",
+                    "gemm" if has_gemm else "vector",
                     tuple(region(x) for x in inputs),
                     output,
                     body,
@@ -216,6 +224,10 @@ def plan_program(program, *, rank, scalars, world_size):
                 fail("local phases require unconditional root/allocation blocks without block iteration bindings")
             walk(node.block)
         elif isinstance(node, tirx.SBlock):
+            if allow_vector and node.name_hint == "SIMD_VF":
+                replacements = {key: tirx.const(value, key.dtype) for key, value in env.items()}
+                local.append(tirx.stmt_functor.substitute(node, replacements))
+                return
             if node.iter_vars or node.match_buffers:
                 fail("block iteration variables and match_buffer aliases are unsupported in local phases")
             unknown = set(node.annotations) - {"layout_map"}

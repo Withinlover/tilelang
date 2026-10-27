@@ -1,6 +1,6 @@
 # P0 DSL 实现与本机验证记录
 
-日期：2026 年 10 月 23 日。
+首次记录：2026 年 10 月 23 日；单 kernel 融合增补：2026 年 10 月 27 日。
 
 目标：当前仓库 Ascend 950 / AscendC；本文记录的验证全部在本机完成，未执行真实双卡。设计契约见 [P0 DSL 设计](distributed_p0_dsl.md)，Simulator 能力依据见[双卡仿真能力评估](cannsim_dual_rank_feasibility.md)。本机协议/CANN 流程见[联仿测试指南](../testing/distributed_p0.md)，新增原生路径的依赖、构建、启动与验收见[原生双卡测试指南](../testing/distributed_native.md)。
 
@@ -10,7 +10,10 @@
 
 联仿 profile 是 `ascend950_cannsim_v1`，不提供真实跨卡传输。本记录第 2–7 节保留其首次交付的证据与已观察测试结果。新增原生分段 profile `ascend950_shmem_mte_phased_v1` 从相同源 DSL 生成 SHMEM 通信 kernel 与独立 TileLang 计算 kernel；代码、原生编译与 Host ABI 已在本机验证，真实双卡执行仍待用户验收，见第 9 节。
 
-原设计的单 kernel P0-A 通信合法化和 P0-B 融合调度仍未实现。原生分段路径也不将完整函数编译成 mixed kernel；它复用现有 `tvm_ffi` 分别提交已经消解 TD 的子 kernel。普通 `tilelang.compile`、JIT/cache、`tilelang.lower` 和 Ascend pipeline 对原始 TD 函数的 gate 继续保留；原目标名称 `ascend950_mapped_mte_v1` 仍未启用。
+第 2–9 节是此前联仿与分段路径的历史记录。当时尚未实现单 kernel P0-A/P0-B。
+2026-10-27 新增两个显式融合 profile，详见第 10 节及[融合路径验收](../testing/distributed_fused.md)。
+普通 `tilelang.compile`、`tilelang.lower` 和 Ascend pipeline 对原始 TD 函数的 gate 继续保留；
+原目标名称 `ascend950_mapped_mte_v1` 未启用。历史测试数字不计入本次新增验证。
 
 ## 2. 联仿从源 DSL 到结果的证据链
 
@@ -244,3 +247,82 @@ TILELANG_TEST_SHMEM_BRIDGE=1 python -m pytest -q \
 构建输出保留 `lowering.json`、`build.json`、`validation.json`、原始/兼容转换源码、TIR、包含设备代码的共享库及哈希；`device_executed=false` 是本机 build 的预期结果。所有原始产物留在本地，不随 Git 提交。
 
 真实双卡的精度、READY/ACK 可见性、热点 slot 和实际进度仍待用户在保密机器上按[原生双卡测试指南](../testing/distributed_native.md)执行。当前分段实现没有通信计算重叠，也没有单 kernel P0-A/P0-B 融合性能结论。
+
+## 10. 单 kernel P0-A/P0-B 实现与本机验证（2026-10-27）
+
+新增 `ascend950_shmem_mte_p0a_v1` 和 `ascend950_shmem_mte_p0b_v1`，复用已有 Session、
+对称分配、peer 映射、epoch、stream、D.jit 和关闭生命周期。默认 phased profile 保留。
+融合路径把每 rank 的有限静态计划降成一个真实设备 PrimFunc，参数为对称 Buffer 与
+本次 launch 的 int32 epoch；同一 launch 每 rank 只提交一个物理 kernel。
+
+- P0-A：pure AIV，支持 put/get、受限 FP32 GM↔UB 搬运及 `vld/vadd/vsts`，
+  保留顺序、显式同步、可见性/完成动作和退出 drain。向量掩码只接受 FP32 全 64 lane
+  的 `pset(32, PAT_ALL)`，拒绝隐式 GM 访问、非法 layout、越界及不支持的向量语义。
+- P0-B：单 mixed block，唯一通信发起者 AIV0；同 kernel 内执行手写协议 AllGather
+  和固定 BF16 64×64 GEMM、FP32 输出。acquire 后才可搬入接收数据；ACK 等待接收区
+  GM→L1 DMA 完成，但不等待后续 MMAD/Fixpipe，允许后续通信与 Cube 计算重叠。
+  这是有界静态展开的受限流水，不支持一般动态 Stage/Pipelined 通信。
+- 编译器：通信 task 具有显式 acquire/release region effects，实际经过 AutoSchedule、
+  InsertSync、MultiBuffer 及后段变换；没有删除原始 TD native gate 或关闭 AutoSchedule。
+  有限协议预检拒绝未排序访问、提前 slot 复用、未完成 get 源 lease、确定性等待死锁和
+  epoch 相关的数据地址/计算变化。调度后和终检核对通信顺序、ABI、effects 与 scratch。
+- 资源：共用不参与版本化的 4096 字节 UB scratch，通信独占 hard-event 7，普通 flag
+  分配使用 0–6 与已有 mutex spill；融合路径保守禁用本地物理存储复用。根作用域的
+  单次直线任务仅在完成图证明旧 WAIT 先于新 SET 时复用 flag，循环保留跨迭代约束。
+  helper/SDK adapter 身份进入缓存，终检拒绝本地指针侵入实际 scratch 范围。
+
+双 rank、单组/通道、单活动 launch、32 字节通信对齐及独立信号单元限制继续适用。
+零工作计划明确拒绝，调用方在 Host 跳过；单 rank 展开最多 4096 条指令，仍须满足
+本地存储、跨核 flag 和 mutex 容量。超限保持 unsupported 诊断，不以删除同步绕过。
+Z3 在部分多轮例上耗尽优化预算并返回 `unknown (canceled)`；AutoSchedule 使用合法
+拓扑回退，保留两核依赖和重叠机会，不宣称完成最优调度。详见[调度与资源边界](../testing/distributed_fused.md#调度与资源验证的准确边界)。
+
+本机环境为 Linux x86_64、Python 3.10、Ascend native/stub build、CANN/Bisheng 9.1，
+目标 `dav-3510`；SHMEM revision 为 `a232a76516c435cd39ecd10125fc6e14a55fc18b`。
+本机没有可用 NPU/`torch_npu`。所有测试使用独立 worktree 的新 native build，未混用
+原 checkout 的 Python 源码或库。原工作区已有未提交修改保持原样，未包含在本次改动中。
+
+| 本机检查 | 实际结果 | 证据范围 |
+| --- | --- | --- |
+| Ascend CMake 完整构建及修改后的增量构建 | 成功 | 编译器/Host 库，不执行设备 |
+| 统一 CPU 回归 | **325 passed，0 skipped，6 deselected** | 排除真实 SDK 与 opt-in bridge；前端、协议、IR、ABI、JIT、运行时及监督脚本 |
+| AutoSchedule 完整目录及 MergeUBAllocations 回归 | **644 passed，31 skipped** | 31 项均缺 Ascend 运行支持；另有 9 个既有 pytest marker warning |
+| 真实 SDK Host bridge DLPack 用例 | **1 passed** | metadata/借用生命周期，未初始化设备 |
+| 全新 cache 的统一 SDK 编译矩阵 | **13/13 passed** | phased/P0-A/P0-B、双 rank，含 7 轮单 slot；所有 `device_executed=false` |
+| P0-A 实际提取的向量计算片段 CANN Simulator | **4096 元素，0 mismatch，最大误差 0** | AIV0 正常 END，report complete；465 条指令事件，453 条带 detail |
+| 同源 AllGather＋GEMM 联仿，3 轮/2 slots | **12 个片段通过，49152 元素，0 mismatch** | 原始 BF16 输入的 FP64 oracle；最大绝对误差约 2.832e-7，无未结 lease/event |
+| 联仿污染负例，1 轮/2 slots | **按预期检出 64 个错误元素，退出 1** | 4 个本地计算片段均通过，独立全局 oracle 检出被污染输入；不是设备负例 |
+| 无设备启动 P0-A 正例与 P0-B 预期负例 | **均被判为失败/未执行设备** | 缺 `torch_npu` 的 rank 错误传播，负例未将基础设施失败误计通过 |
+
+首次 SDK 矩阵曾在七轮 P0-B 压力例耗尽 mutex spill（66 > 32）；修复直线任务完成图
+证明下的 flag 复用后，重新构建 native 库并使用全新 cache 跑完整 13 项，全部通过。
+最终 CPU/调度回归包含安全复用正例与仅有 DMA 发射顺序、没有完成依赖的拒绝负例。
+SDK 编译阶段的“负例”只表示该测试程序可编译，不代表故障已在设备被检出。
+
+本次本地产物位于 `output/distributed/fusion_local_20261027/`，不随 Git 提交：
+
+- `final-cpu/run_r4tgo9tj/`、`final-compile/run_x0332o3l/`：统一入口 JSON、日志、pytest XML 或 SDK 产物。
+- `full-schedule-regression.log`、`full-schedule-regression.xml`、`real-bridge.log`：扩展回归与 ABI 证据。
+- `vector-cosim/`：实际片段提取说明、源码/设备对象哈希、独立审计及 Simulator trace。
+- `cosim/p0_rank_segments_zh979273/`、`cosim-negative/p0_rank_segments_2u3ye46r/`：GEMM 联仿正负例。
+- `no-device/run_sihdzm1x/`：缺运行依赖的失败传播证据。
+
+可复现的主回归命令如下；环境准备、SDK/SHMEM 构建和服务器启动完整命令见
+[融合路径验收指南](../testing/distributed_fused.md)：
+
+```bash
+python -m examples.distributed.run_p0_validation --stages cpu --output-dir output/distributed/p0-acceptance
+TILELANG_CACHE_DIR="$PWD/output/distributed/p0-fresh-cache" \
+  python -m examples.distributed.run_p0_validation --stages compile --keep-going \
+  --sdk-profile cann-9.1 --output-dir output/distributed/p0-acceptance
+python -m pytest -q -rs testing/ascend/auto_schedule \
+  testing/ascend/transform/test_ascend_merge_allocations.py
+TILELANG_TEST_SHMEM_BRIDGE=1 python -m pytest -q \
+  testing/ascend/distributed/test_native_runtime.py -k real_bridge_dlpack
+```
+
+统一服务器入口提供超时监督、子进程退出码、各 rank 日志、独立数值与信号判定、
+严格污染负例、机器可读报告和按 case 重跑；性能入口比较 Host HCCL＋本地 TileLang、
+P0-A 交换＋本地 Cube 与 P0-B 融合，分别记录首次构建/执行、稳态和包含暂存/同步的
+端到端耗时。本机未执行真实双卡和性能测量。**多卡正确性、可见性、进度及性能继续
+保持“待实机验收”**，直到收到用户检查、脱敏的真实服务器结果。
