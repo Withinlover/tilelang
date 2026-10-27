@@ -21,6 +21,21 @@ P0-B 由编译器对受支持的静态轮次计划建立本地任务依赖；每
 零工作计划明确拒绝，调用方须在 Host 跳过；4096 条上限内仍须满足设备资源容量。
 普通 NPU Tensor 的通用分布式 JIT 输入输出、跨算子内存池不在本次验收范围。
 
+融合路径另有两个显式 Host 执行策略：`D.compile(..., execution_policy="strict")`
+保持默认契约，每次 launch 检查源码、helper 和 SHMEM 头文件内容；`execution_policy="artifact"`
+复用首次完整 build 封存的编译输入和已加载 kernel。artifact 稳态保留源码根对象、manifest、
+编译配置身份以及每次 epoch、regions、progress、Session/rank/binding 和跨 rank 检查。
+实际源码校验方式记录为 `source_validation=identity|serialized`：只有当前 FFI 能证明
+该源码对象不可变时才使用 identity 路径，否则保留序列化校验。性能入口要求各次 launch
+及两个 rank 报告同一方式，避免把不同校验开销混为同一结果。
+显式再次 build、新 scalar specialization 或缓存逐出后的重建仍做完整编译输入检查。
+磁盘文件的后续编辑不会改变已经加载的 artifact；需要应用新内容时重新构建，需要逐次
+检查磁盘变动时使用 strict。该区别必须随结果记录，不能把 Host 校验成本变化称为设备优化。
+
+统一入口对 P0-A/P0-B 的 compile/device/performance 默认选择 artifact；phased 始终 strict。
+`--execution-policy strict` 可对照原路径。底层 `run_native_distributed.py` 和 `D.compile`
+的默认值仍为 strict，底层脚本拒绝 phased＋artifact；性能脚本默认显式 artifact。
+
 P0-A 向量例子在 [example_fused_exchange.py](../../examples/distributed/example_fused_exchange.py)：
 本 rank FP32 tile 经 GM→UB、SIMD 倍增、UB→GM 后交换，接收端搬出后才 ACK。
 独立 oracle 用未修改的原始 peer 输入乘二。P0-B 复用
@@ -92,7 +107,7 @@ python -m examples.distributed.run_p0_validation --list
 
 # 一次运行 CPU、真实 SDK 编译和双卡；默认失败即停。
 python -m examples.distributed.run_p0_validation \
-  --stages cpu,compile,device --sdk-profile cann-9.1 \
+  --stages cpu,compile,device --sdk-profile cann-9.1 --execution-policy artifact \
   --devices 0 1 --timeout 900 --operation-timeout 120 \
   --output-dir "$P0_RESULTS"
 
@@ -105,6 +120,11 @@ python -m examples.distributed.run_p0_validation --stages device --devices 0 1 -
 python -m examples.distributed.run_p0_validation \
   --stages compile,device --cases p0b-hot-slot,p0b-negative \
   --devices 0 1 --output-dir "$P0_RESULTS" --keep-going
+
+# 对照 strict 路径：相同 case、输入和验收要求。
+python -m examples.distributed.run_p0_validation \
+  --stages compile,device --execution-policy strict \
+  --devices 0 1 --output-dir "$P0_RESULTS"
 ```
 
 默认 case 包括 phased put/get/GEMM；P0-A put/get/向量交换；P0-B AllGather＋GEMM。
@@ -124,6 +144,7 @@ unused-slot 为 1 轮、2 slots，检查未使用信号维持零值。
 ```bash
 python -m examples.distributed.run_native_distributed \
   --mode run --execution p0a --case vector --rounds 7 --slots 1 --launches 3 \
+  --execution-policy artifact \
   --rank-delay-ms 200 --delay-rank 1 --devices 0 1 \
   --sdk-profile cann-9.1 --output-dir "$P0_RESULTS/manual-vector"
 ```
@@ -157,6 +178,9 @@ python3 examples/distributed/summarize_p0.py "$P0_RESULTS/run_xxx"
 每 mode 一行核心结果，附参数、首次 build/cache-load、首次执行/E2E 的两 rank 最大值，以及
 外层和 native 分段中位数。除 HCCL/候选比值外，同时报告候选/HCCL 的 `slowdown_x`，
 避免用低精度的 `0.0x` 隐藏真实差距；缺失、非有限或不可表示的字段为 `null`。
+新增的 `execution_policy` 记录性能模式及各 compile/device case 的实际策略；旧报告和
+HCCL 为 `null`。性能 `source_validation` 来自实际 run，缺失也为 `null`；Markdown 在既有
+参数表合并展示 `policy / source guard`，报告仍约 59 行。
 
 分享版只保留白名单 commit、依赖版本、case 参数、退出码/超时、数值误差及聚合统计。
 账号、主机名、绝对路径、原始命令、原始错误文本和逐次样本不复制到分享文件；错误仅保留
@@ -180,7 +204,12 @@ python3 examples/distributed/summarize_p0.py "$P0_RESULTS/run_xxx"
 ```bash
 python -m examples.distributed.run_p0_validation \
   --stages performance --benchmark-iterations 20 --timeout 1800 \
-  --devices 0 1 --sdk-profile cann-9.1 --output-dir "$P0_RESULTS"
+  --execution-policy artifact --devices 0 1 --sdk-profile cann-9.1 --output-dir "$P0_RESULTS"
+
+# 只切换 Host 执行策略；保留相同数学 workload 和计时边界。
+python -m examples.distributed.run_p0_validation \
+  --stages performance --benchmark-iterations 20 --timeout 1800 \
+  --execution-policy strict --devices 0 1 --sdk-profile cann-9.1 --output-dir "$P0_RESULTS"
 ```
 
 三个模式执行相同的 3 轮 BF16 AllGather＋64×64 GEMM，输出 FP32：
@@ -199,6 +228,8 @@ HCCL 一次 `all_gather` 批量传输全部 3 轮，P0 每轮交换 8 KiB 并执
 
 每模式独立启动两个 worker；统一入口使用各 rank 独立的新 TileLang cache 目录。
 记录首次 build/cache load、首次执行、3 次 warmup 后 20 个稳态样本。
+artifact 的封存/建立包含在首次 build/cache load 中。所有逐次协议检查仍在原 prepare、
+launch 和 complete 边界内；没有从测得的 execution/e2e 中扣除检查或等待时间。
 这些是带同步的 **Host wall time**：`execution` 包含提交、分布式预检和必要同步，
 `end_to_end` 进一步包含每轮输入暂存、ticket 准备和输出回读。
 原始输入生成、独立 CPU oracle、Session/设备缓冲初始化分配与首次编译不计入稳态样本。
@@ -229,6 +260,15 @@ build/cache validation、build preflight、绑定与提交、stream sync 和 rep
 每项的两 rank 最大值可能来自不同 rank，分段最大值或
 p95 不能相加还原整体时间。`outside_e2e_alignment_seconds` 记录原本就在计时边界外的
 轮次对齐及初始同步；数据生成和 CPU oracle 仍在边界外。
+
+`build_or_cache_validation` 与 `build_preflight` 在同一 rank 上相邻且不重叠。后一项包含
+控制面处理和等待另一 rank 到达，不能全部视为额外 CPU 构建工作。例如假设某轮 rank 0
+构建 5 ms、等待 0 ms，rank 1 构建 3 ms、等待 2 ms；各段取 rank 最大值会得到 5 ms 和
+2 ms，但两个 rank 各自的合计都只有 5 ms。该例仅说明聚合含义，并非设备测量。
+只有配对中位数时不能反推同一轮的 rank 偏斜，也不能把 preflight 中位数从 execution
+中位数扣除后称为 kernel 时间。每 rank 的 execution 起点在各自输入暂存之后，launch
+还可能等待 peer 完成暂存；当前指标是 rank 本地 Host wall time 的配对最大值，未提供
+统一全局起点或纯设备 event 延迟。需要定位偏斜时应在服务器检查本地逐 rank/逐次明细。
 
 上述分段仍是 Host wall time。`launch` 里的计划验证、IR/hash、跨 rank 元数据检查以及
 缓存身份检查都是当前 API 成本；不能把这些移出计时后称为端到端提速。

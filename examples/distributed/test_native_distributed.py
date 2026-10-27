@@ -39,6 +39,17 @@ def test_native_examples_plan_both_ranks_without_helper(case):
             assert all(item[2].rank == (1 - rank if case == "get" else rank) for item in transfers)
 
 
+@pytest.mark.parametrize("case", ["put", "gemm", "vector"])
+@pytest.mark.parametrize("rounds,slots", [(1, 2), (7, 1)])
+def test_example_snapshots_support_immutable_source_identity(case, rounds, slots):
+    from tilelang import tvm
+    from tilelang.ascend.distributed.artifact_identity import source_supports_identity_guard
+
+    encoded = tvm.ir.save_json(make_program(case, rounds, slots))
+    snapshot = tvm.ir.load_json(encoded)
+    assert source_supports_identity_guard(snapshot, encoded)
+
+
 def _results(tmp_path, case, *, fault="none", corrupt=False):
     execution = "p0a" if case == "vector" else "phased"
     args = SimpleNamespace(case=case, execution=execution, rounds=3, slots=2, launches=2, fault=fault)
@@ -140,6 +151,43 @@ def test_requested_fault_cannot_pass_when_input_was_not_corrupted(tmp_path):
     result = validate_outputs(tmp_path, args, reports)
     assert result["accuracy"][0]["passed"]
     assert not result["passed"] and not result["expected_negative_detected"]
+
+
+def test_artifact_acceptance_requires_matching_execution_policy(tmp_path):
+    args, reports = _results(tmp_path, "vector")
+    args.execution_policy = "artifact"
+    assert not validate_outputs(tmp_path, args, reports)["report_complete"]
+    for report in reports:
+        for launch in report["launches"]:
+            launch["execution"]["execution_policy"] = "artifact"
+    assert validate_outputs(tmp_path, args, reports)["passed"]
+    reports[1]["launches"][1]["execution"]["execution_policy"] = "strict"
+    assert not validate_outputs(tmp_path, args, reports)["report_complete"]
+
+
+@pytest.mark.parametrize("execution,policy,case", [("phased", "strict", "put"), ("p0a", "artifact", "vector"), ("p0b", "strict", "gemm")])
+def test_native_compile_forwards_only_supported_execution_policy(tmp_path, monkeypatch, execution, policy, case):
+    from examples.distributed import run_native_distributed as runner
+
+    options = {}
+    monkeypatch.setattr(runner.D, "compile", lambda program, **kwargs: options.update(kwargs))
+    args = SimpleNamespace(
+        case=case, execution=execution, execution_policy=policy, rounds=1, slots=1, shmem_root=None, sdk_profile="native"
+    )
+    runner.compile_program(args, tmp_path)
+    assert options.get("execution_policy") == (None if execution == "phased" else policy)
+
+
+def test_native_cli_keeps_strict_default_and_rejects_phased_artifact(monkeypatch):
+    from examples.distributed import run_native_distributed as runner
+
+    policies = []
+    monkeypatch.setattr(runner, "worker", lambda args: policies.append(args.execution_policy) or 0)
+    assert runner.main(["--worker-rank", "0", "--execution", "p0a", "--case", "put"]) == 0
+    assert policies == ["strict"]
+    with pytest.raises(SystemExit) as error:
+        runner.main(["--execution-policy", "artifact"])
+    assert error.value.code == 2
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux process group cleanup")

@@ -589,3 +589,20 @@ def test_prepare_without_extra_scalars_preserves_early_epoch_validation(session)
     with pytest.raises(RuntimeError, match="RUNNING"):
         session.launch_kernel(lambda: None)
     assert not any(call[0] == "launch" for call in session.bridge.calls)
+
+
+def test_native_session_normalizes_shmem_root_once(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    root = tmp_path / "shmem"
+    root.mkdir()
+    session = NativeSession(
+        rank=0,
+        world_size=2,
+        device=0,
+        bootstrap="tcp://127.0.0.1:25100",
+        control=Control(),
+        bridge=Bridge(),
+        shmem_root="shmem",
+    )
+    assert session.shmem_root == root
+    session.close()

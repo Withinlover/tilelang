@@ -96,6 +96,7 @@ def execution_profile(args):
 
 
 def compile_program(args, output):
+    policy_options = {"execution_policy": getattr(args, "execution_policy", "strict")} if args.execution != "phased" else {}
     return D.compile(
         make_program(args.case, args.rounds, args.slots),
         profile=execution_profile(args),
@@ -104,6 +105,7 @@ def compile_program(args, output):
         compile_profile="cann-9.1-gemm64" if args.sdk_profile == "cann-9.1" else "native",
         transport_compile_profile="cann-9.1-shmem" if args.sdk_profile == "cann-9.1" else "native",
         output_dir=output,
+        **policy_options,
     )
 
 
@@ -112,7 +114,7 @@ def worker(args):
     root = Path(args.output_dir).resolve()
     output = root / f"rank{rank}"
     output.mkdir()
-    report = {"rank": rank, "device": args.devices[rank], "completed": False, "launches": []}
+    report = {"rank": rank, "device": args.devices[rank], "execution_policy": args.execution_policy, "completed": False, "launches": []}
     session = None
     try:
         compile_started = time.perf_counter()
@@ -302,6 +304,7 @@ def validate_outputs(root, args, worker_reports):
                 complete and execution.get("rank") == rank and execution.get("epoch_base") == base and execution.get("epoch_end") == end
             )
             complete = complete and execution.get("phases_count") == len(phases) and execution.get("phases") == phases
+            complete = complete and execution.get("execution_policy", "strict") == getattr(args, "execution_policy", "strict")
             if getattr(args, "execution", "phased") != "phased":
                 complete = complete and execution.get("physical_kernel_count") == 1
                 complete = complete and execution.get("execution") == f"native-single-kernel-{args.execution}"
@@ -343,6 +346,7 @@ def supervise(args):
     report = {
         "profile": execution_profile(args),
         "execution_mode": args.execution,
+        "execution_policy": args.execution_policy,
         "rank_delay_ms": args.rank_delay_ms,
         "delay_rank": args.delay_rank,
         "case": args.case,
@@ -379,6 +383,8 @@ def supervise(args):
                 args.case,
                 "--execution",
                 args.execution,
+                "--execution-policy",
+                args.execution_policy,
                 "--rank-delay-ms",
                 str(args.rank_delay_ms),
                 "--delay-rank",
@@ -452,6 +458,12 @@ def main(argv=None):
     parser.add_argument("--case", choices=("gemm", "put", "get", "vector"), default="gemm")
     parser.add_argument("--execution", choices=("phased", "p0a", "p0b"), default="phased")
     parser.add_argument(
+        "--execution-policy",
+        choices=("strict", "artifact"),
+        default="strict",
+        help="P0 build-input validation policy; phased requires strict",
+    )
+    parser.add_argument(
         "--rank-delay-ms", type=float, default=0, help="Delay one rank after preflight, before its first device kernel per launch"
     )
     parser.add_argument("--delay-rank", type=int, choices=(0, 1), default=1)
@@ -483,6 +495,8 @@ def main(argv=None):
         parser.error("P0-A has no Cube GEMM; use --execution p0b or phased")
     if args.execution == "p0b" and args.case != "gemm":
         parser.error("P0-B validation uses the fixed AllGather + GEMM program")
+    if args.execution == "phased" and args.execution_policy != "strict":
+        parser.error("phased execution requires --execution-policy strict")
     if args.operation_timeout <= 0 or args.timeout <= 0:
         parser.error("timeouts must be positive")
     if args.mode != "lower" and not args.shmem_root:
@@ -493,6 +507,7 @@ def main(argv=None):
         return supervise(args)
     compiled = compile_program(args, args.output_dir)
     result = compiled.lower(output_dir=args.output_dir, scalars={"epoch0": 0}, epochs=args.rounds, shmem_root=args.shmem_root)
+    result["execution_policy"] = args.execution_policy
     if args.mode == "build":
         from tilelang.ascend.distributed.native_runtime import build_host_bridge
 

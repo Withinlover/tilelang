@@ -91,9 +91,10 @@ def test_fused_lower_single_entry_and_protocol_source(case, tmp_path):
 
 
 @pytest.mark.parametrize("profile", [D.P0A_PROFILE, D.P0B_PROFILE])
-def test_fused_session_one_launch_physical_signal_abi_and_cache(monkeypatch, tmp_path, profile):
+@pytest.mark.parametrize("execution_policy", ["strict", "artifact"])
+def test_fused_session_one_launch_physical_signal_abi_and_cache(monkeypatch, tmp_path, profile, execution_policy):
     root = fake_headers(tmp_path)
-    kernel = D.compile(exchange(1, 2), profile=profile, shmem_root=root, debug=False)
+    kernel = D.compile(exchange(1, 2), profile=profile, shmem_root=root, debug=False, execution_policy=execution_policy)
     built, submitted = [], []
 
     def compile_fake(func, **kwargs):
@@ -116,6 +117,8 @@ def test_fused_session_one_launch_physical_signal_abi_and_cache(monkeypatch, tmp
         ticket = D.prepare_launch(session, kernel, channel=channel, epochs=1, protocol="fused-abi")
         result = D.complete(D.launch(kernel, ticket=ticket))
         assert result["physical_kernel_count"] == 1
+        assert result["execution_policy"] == execution_policy
+        assert bool(result["artifact_id"]) == (execution_policy == "artifact")
         assert result["timing_basis"] == "host_wall"
         timings = result["timing_seconds"]
         assert set(timings) == {
@@ -372,3 +375,271 @@ def test_failed_plan_cannot_rebind_previous_build_specialization(monkeypatch, tm
     monkeypatch.setattr(tilelang, "compile", lambda func, **kwargs: built.append(func) or object())
     kernel.build(shmem_root=fake_headers(tmp_path), plans=first)
     assert all(actual.same_as(funcs[rank]) for rank, actual in enumerate(built))
+
+
+def _fake_loaded_kernel(func, **kwargs):
+    """Exercise real TVM-FFI lazy loading with a device-free module callable."""
+    from threading import Lock
+    from types import SimpleNamespace
+    from tilelang.jit.adapter.tvm_ffi import TVMFFIKernelAdapter
+
+    adapter = TVMFFIKernelAdapter.__new__(TVMFFIKernelAdapter)
+    adapter.ir_module = tilelang.tvm.IRModule({"main": func})
+    adapter.params, adapter.result_idx = list(func.params), []
+    adapter._ffi_callee_allocated_output_abi = False
+    adapter.dynamic_symbolic_map = {param: (2, i, -1, 1) for i, param in enumerate(func.params)}
+    adapter.executable, adapter._executable_lock = None, Lock()
+    kernel = SimpleNamespace(adapter=adapter, loads=0, submissions=[])
+    kernel.torch_function = lambda *args: pytest.fail("sealed launch must call the captured packed entry")
+
+    def load():
+        kernel.loads += 1
+        return SimpleNamespace(main=lambda *args: kernel.submissions.append(args))
+
+    adapter._make_executable = load
+    return kernel
+
+
+@pytest.fixture
+def sealed_artifact(monkeypatch, tmp_path):
+    root = fake_headers(tmp_path)
+    kernel = D.compile(exchange(3, 1), profile=D.P0A_PROFILE, shmem_root=root, execution_policy="artifact", debug=False)
+    monkeypatch.setattr(tilelang, "compile", _fake_loaded_kernel)
+    kernel.build(shmem_root=root, epochs=3)
+    return kernel, root
+
+
+@pytest.mark.parametrize("case", ["put", "gemm"])
+def test_artifact_warm_launch_uses_loaded_kernels_without_build_inputs(monkeypatch, tmp_path, case):
+    root = fake_headers(tmp_path)
+    profile = D.P0B_PROFILE if case == "gemm" else D.P0A_PROFILE
+    kernel = D.compile(
+        allgather_gemm(3, 1) if case == "gemm" else exchange(3, 1),
+        profile=profile,
+        shmem_root=root,
+        execution_policy="artifact",
+        debug=False,
+    )
+    monkeypatch.setattr(tilelang, "compile", _fake_loaded_kernel)
+    kernel.build(shmem_root=root, epochs=3)
+    artifact_id = kernel.build_report["artifact_id"]
+    assert all(loaded.kernel.loads == 1 for loaded in kernel._active_reference["artifact"].kernels)
+    assert kernel._identity_guard
+    session = D.init(
+        profile=profile, rank=0, device=0, bootstrap="tcp://127.0.0.1:25100", control=Control(), bridge=Bridge(), shmem_root=root
+    )
+    for spec in kernel.manifest["objects"]:
+        common = dict(key=spec["key"], shape=spec["shape"], dtype=spec["dtype"])
+        if spec["kind"] == "signal":
+            D.alloc_signals(session, **common)
+        else:
+            D.alloc_symmetric(session, remote_access=spec["remote_access"], **common)
+    channel = D.channel(session, key="comm")
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("warm artifact must not rebuild, read source files or serialize immutable TIR")
+
+    with monkeypatch.context() as warmed:
+        warmed.setattr(kernel, "build", forbidden)
+        warmed.setattr(kernel, "_configs", forbidden)
+        warmed.setattr(kernel, "_header_fingerprint", forbidden)
+        warmed.setattr(tilelang.tvm.ir, "save_json", forbidden)
+        for _ in range(2):
+            ticket = D.prepare_launch(session, kernel, channel=channel, epochs=3, protocol="artifact-warm")
+            report = D.complete(D.launch(kernel, ticket=ticket))
+            assert report["artifact_id"] == artifact_id
+            assert report["execution_policy"] == "artifact"
+            assert report["source_validation"] == "identity"
+            assert report["completed"]
+    D.close(session)
+
+
+def test_artifact_is_snapshot_but_explicit_build_rechecks_headers(sealed_artifact):
+    kernel, root = sealed_artifact
+    plans = kernel.plan(epoch_base=3, epoch_end=6)
+    original_id = kernel.build_report["artifact_id"]
+    (root / "include/shmem.h").write_text("edited after artifact creation")
+    assert kernel._prepare_executable(shmem_root=root, plans=plans) == original_id
+    with pytest.raises(ValueError, match="SHMEM device headers changed"):
+        kernel.build(shmem_root=root, plans=plans)
+
+
+def test_artifact_explicit_build_rechecks_helper(monkeypatch, tmp_path):
+    from importlib import import_module
+
+    root = fake_headers(tmp_path)
+    env = import_module("tilelang.env")
+    helper = tmp_path / "templates/tl_templates/ascend/distributed.h"
+    helper.parent.mkdir(parents=True)
+    helper.write_text("first helper")
+    monkeypatch.setattr(env, "TILELANG_TEMPLATE_PATH", str(tmp_path / "templates"))
+    kernel = D.compile(exchange(1, 1), profile=D.P0A_PROFILE, shmem_root=root, execution_policy="artifact")
+    monkeypatch.setattr(tilelang, "compile", lambda *args, **kwargs: object())
+    kernel.build(shmem_root=root)
+    helper.write_text("changed helper")
+    plans = kernel.plan(epoch_base=1)
+    assert kernel._prepare_executable(shmem_root=root, plans=plans)
+    with pytest.raises(ValueError, match="fusion device helper changed"):
+        kernel.build(shmem_root=root, plans=plans)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("profile", D.P0B_PROFILE),
+        ("compile_profile", "cann-9.1-gemm64"),
+        ("transport_compile_profile", "cann-9.1-shmem"),
+        ("header_fingerprint", "changed"),
+        ("helper_fingerprint", "changed"),
+        ("sdk_adapter_fingerprint", "changed"),
+    ],
+)
+def test_artifact_rejects_changed_compilation_configuration(sealed_artifact, field, value):
+    kernel, _ = sealed_artifact
+    setattr(kernel, field, value)
+    with pytest.raises(ValueError, match="configuration was modified"):
+        kernel.plan(epoch_base=3)
+
+
+def test_artifact_rejects_source_rebind_manifest_and_handle_replacement(sealed_artifact):
+    kernel, root = sealed_artifact
+    plans = kernel.plan()
+    key = kernel._rank_keys[0]
+    saved = kernel._kernels[key]
+    kernel._kernels[key] = object()
+    with pytest.raises(ValueError, match="kernel handle was replaced"):
+        kernel._prepare_executable(shmem_root=root, plans=plans)
+    kernel._kernels[key] = saved
+    kernel.manifest["objects"][0]["shape"][0] += 1
+    with pytest.raises(ValueError, match="execution manifest was modified"):
+        kernel.plan()
+    kernel.manifest["objects"][0]["shape"][0] -= 1
+    kernel.prim_func = kernel.prim_func.with_attr("changed", 1)
+    with pytest.raises(ValueError, match="source was rebound"):
+        kernel.plan()
+
+
+def test_artifact_mutable_metadata_keeps_full_source_validation(monkeypatch, tmp_path):
+    from tvm_ffi import Dict
+
+    root = fake_headers(tmp_path)
+    source = exchange(1, 1).with_attr("test_mutable_metadata", Dict({"value": 1}))
+    kernel = D.compile(source, profile=D.P0A_PROFILE, shmem_root=root, execution_policy="artifact")
+    assert not kernel._identity_guard
+    monkeypatch.setattr(tilelang, "compile", lambda *args, **kwargs: object())
+    kernel.build(shmem_root=root)
+    kernel.prim_func.attrs["test_mutable_metadata"]["value"] = 2
+    with pytest.raises(ValueError, match="compiled distributed source"):
+        kernel.plan()
+
+
+def test_artifact_build_failure_does_not_publish(monkeypatch, tmp_path):
+    root = fake_headers(tmp_path)
+    kernel = D.compile(exchange(1, 1), profile=D.P0A_PROFILE, shmem_root=root, execution_policy="artifact")
+    calls = []
+
+    def fail_second(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 2:
+            raise RuntimeError("second rank compile failed")
+        return object()
+
+    monkeypatch.setattr(tilelang, "compile", fail_second)
+    with pytest.raises(RuntimeError, match="second rank"):
+        kernel.build(shmem_root=root)
+    assert kernel._active_reference["artifact"] is None
+    assert len(kernel._kernels) == 1
+
+
+def test_artifact_new_scalar_and_eviction_require_fresh_build_validation(monkeypatch, tmp_path):
+    from tvm import tirx
+
+    original = exchange(1, 1)
+    choice = tirx.Var("choice", "int32")
+    source = tirx.PrimFunc([*original.params, choice], original.body, buffer_map=original.buffer_map, attrs=original.attrs)
+    root = fake_headers(tmp_path)
+    header = root / "include/shmem.h"
+    initial = header.read_text()
+    kernel = D.compile(source, profile=D.P0A_PROFILE, shmem_root=root, execution_policy="artifact")
+    monkeypatch.setattr(tilelang, "compile", lambda *args, **kwargs: object())
+    kernel.build(shmem_root=root, scalars={"choice": 0})
+    header.write_text("changed")
+    plans = kernel.plan(scalars={"choice": 1})
+    with pytest.raises(ValueError, match="SHMEM device headers changed"):
+        kernel._prepare_executable(shmem_root=root, plans=plans)
+    header.write_text(initial)
+    for value in range(1, 5):
+        kernel.build(shmem_root=root, scalars={"choice": value})
+    assert (("choice", 0),) not in kernel._reference_cache
+    # Several scalar specializations may legitimately share one compiled key.
+    plans = kernel.plan(scalars={"choice": 4})
+    assert kernel._prepare_executable(shmem_root=root, plans=plans)
+    header.write_text("changed after LRU eviction")
+    plans = kernel.plan(scalars={"choice": 0})
+    with pytest.raises(ValueError, match="SHMEM device headers changed"):
+        kernel._prepare_executable(shmem_root=root, plans=plans)
+
+
+def test_artifact_keeps_dynamic_interval_and_signal_progress_checks(sealed_artifact):
+    kernel, root = sealed_artifact
+    with pytest.raises(ValueError, match="outside the prepared"):
+        kernel.plan(epoch_base=3, epoch_end=4)
+    with pytest.raises(ValueError, match="must not decrease"):
+        kernel.plan(epoch_base=3, epoch_end=6, initial_signals={(0, "Ready", 0): 100})
+    plans = kernel.plan(epoch_base=3, epoch_end=6)
+    with pytest.raises(ValueError, match="SHMEM root does not match"):
+        kernel._prepare_executable(shmem_root=root.parent, plans=plans)
+
+
+@pytest.mark.parametrize("field", ["adapter", "torch_function", "executable"])
+def test_artifact_rejects_nested_executable_handle_replacement(sealed_artifact, field):
+    kernel, root = sealed_artifact
+    plans = kernel.plan()
+    loaded = kernel._active_reference["artifact"].kernels[0]
+    target = loaded.adapter if field == "executable" else loaded.kernel
+    setattr(target, field, object())
+    with pytest.raises(ValueError, match="executable handle was replaced"):
+        kernel._prepare_executable(shmem_root=root, plans=plans)
+
+
+def test_artifact_eager_load_failure_does_not_publish(monkeypatch, tmp_path):
+    root = fake_headers(tmp_path)
+    kernel = D.compile(exchange(1, 1), profile=D.P0A_PROFILE, shmem_root=root, execution_policy="artifact")
+
+    def failed_load(func, **kwargs):
+        result = _fake_loaded_kernel(func, **kwargs)
+
+        def fail():
+            raise RuntimeError("eager host loading failed")
+
+        result.adapter._make_executable = fail
+        return result
+
+    monkeypatch.setattr(tilelang, "compile", failed_load)
+    with pytest.raises(RuntimeError, match="eager host loading failed"):
+        kernel.build(shmem_root=root)
+    assert kernel._active_reference["artifact"] is None
+
+
+def test_artifact_final_report_failure_does_not_publish(monkeypatch, tmp_path):
+    from importlib import import_module
+    from pathlib import Path
+
+    root = fake_headers(tmp_path)
+    kernel = D.compile(exchange(1, 1), profile=D.P0A_PROFILE, shmem_root=root, execution_policy="artifact")
+
+    def fake_export(func, **kwargs):
+        result = _fake_loaded_kernel(func, **kwargs)
+        result.get_kernel_source = lambda: "compiled source placeholder"
+        result.export_library = lambda path: Path(path).write_bytes(b"test placeholder")
+        return result
+
+    monkeypatch.setattr(tilelang, "compile", fake_export)
+
+    def fail_report(*args, **kwargs):
+        raise OSError("report filesystem failure")
+
+    monkeypatch.setattr(import_module("tilelang.ascend.distributed.fused"), "_json", fail_report)
+    with pytest.raises(OSError, match="report filesystem failure"):
+        kernel.build(shmem_root=root, output_dir=tmp_path / "export")
+    assert kernel._active_reference["artifact"] is None

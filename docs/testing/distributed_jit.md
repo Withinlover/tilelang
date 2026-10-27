@@ -72,6 +72,27 @@ SHMEM 源码根目录从 Session 传入绑定，不必在每个 JIT 工厂上重
 Session 会复用 workspace；需要同一程序的独立状态时，可显式使用双方一致的
 `.bind(session, key="another-instance")`。
 
+### 固定构建输入的融合执行
+
+P0-A/P0-B 可显式设置 `D.jit(..., execution_policy="artifact")`；直接调用
+`D.compile` 使用同名参数。默认 `strict` 保留每次执行对源码及设备构建文件的完整
+检查，phased profile 当前只支持 `strict`。
+
+`artifact` 在首次构建时完整验证并固定源码快照、ABI、编译配置和已加载的两个 rank
+kernel。后续调用复用这些已编译对象，不再读取磁盘头文件来重新确认已完成的构建。
+这意味着运行期间编辑 SDK/helper 文件不会替换现有产物；需要采用新文件时，应重新
+编译并创建相应绑定。显式 `.build()`、新运行时 scalar 专化或被驱逐后重建仍做完整
+文件内容检查，检测到与原构建约定不符时要求重建程序。
+
+每次调用仍验证源码快照身份、manifest、编译配置、Session 所有权、实际 scalar、
+epoch 区间、信号进度及跨 rank 一致性。普通只读 TIR 使用经过证明的身份检查；
+包含可变或未知 metadata 的源码继续逐次比较完整序列化内容。未证明不可变的节点
+不会仅凭 root 地址跳过检查。构建模式记录在 manifest 和运行报告，两个 rank 必须
+一致；它不改变 READY/ACK、DMA 完成、退出 drain 或同步要求。
+
+性能验收命令、两种模式对照及首次构建与稳态口径见
+[融合路径验收指南](distributed_fused.md#性能口径)。
+
 ## 对称堆与生命周期
 
 - 对称堆在进程绑定设备后、初始化 Session 时建立，不需要在启动 Python 前申请。

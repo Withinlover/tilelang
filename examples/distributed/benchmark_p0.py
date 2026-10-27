@@ -135,6 +135,12 @@ def main(argv=None):
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--slots", type=int, default=2)
     parser.add_argument("--sdk-profile", choices=("native", "cann-9.1"), default="cann-9.1")
+    parser.add_argument(
+        "--execution-policy",
+        choices=("strict", "artifact"),
+        default="artifact",
+        help="P0 build-input validation policy; HCCL is unaffected",
+    )
     parser.add_argument("--shmem-root", default=os.environ.get("SHMEM_ROOT"))
     parser.add_argument("--shmem-library", default=os.environ.get("SHMEM_LIBRARY"))
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -159,7 +165,16 @@ def main(argv=None):
     torch.npu.set_device(device)
     root = args.output_dir.resolve()
     root.mkdir(parents=True, exist_ok=True)
-    result = {"rank": rank, "mode": args.mode, "passed": False, "device_executed": False, "checks": [], "timing_samples": []}
+    result = {
+        "rank": rank,
+        "mode": args.mode,
+        "execution_policy": None if args.mode == "hccl" else args.execution_policy,
+        "source_validation": None,
+        "passed": False,
+        "device_executed": False,
+        "checks": [],
+        "timing_samples": [],
+    }
     session = None
     try:
         started = time.perf_counter()
@@ -183,6 +198,7 @@ def main(argv=None):
                 shmem_root=args.shmem_root,
                 compile_profile="cann-9.1-gemm64" if args.sdk_profile == "cann-9.1" else "native",
                 transport_compile_profile="cann-9.1-shmem" if args.sdk_profile == "cann-9.1" else "native",
+                execution_policy=args.execution_policy,
                 debug=False,
             )
             compiled.build(shmem_root=args.shmem_root, epochs=args.rounds)
@@ -259,6 +275,8 @@ def main(argv=None):
                 execution = D.complete(run)
                 if execution.get("physical_kernel_count") != 1:
                     raise AssertionError("fused benchmark requires exactly one communication/fused device kernel")
+                if execution.get("execution_policy", "strict") != args.execution_policy:
+                    raise AssertionError("native execution policy differs from the requested benchmark policy")
                 complete_ended = time.perf_counter()
                 stages["launch"] = launch_ended - execution_started
                 stages["complete"] = complete_ended - launch_ended
@@ -286,6 +304,12 @@ def main(argv=None):
             if args.mode != "hccl":
                 if execution.get("timing_basis") != "host_wall" or not execution.get("timing_seconds"):
                     raise AssertionError("native run must provide host-wall attribution for the measured launch")
+                guard = execution.get("source_validation")
+                if guard not in ("identity", "serialized"):
+                    raise AssertionError("native run must identify its source validation strategy")
+                if result["source_validation"] is not None and result["source_validation"] != guard:
+                    raise AssertionError("source validation strategy changed between benchmark iterations")
+                result["source_validation"] = guard
                 native_timing = execution["timing_seconds"]
             result["timing_samples"].append(
                 {
@@ -330,10 +354,14 @@ def main(argv=None):
             dist.all_gather_object(reports, result)
             dist.destroy_process_group()
         if rank == 0:
+            if any(item.get("source_validation") != result["source_validation"] for item in reports):
+                raise AssertionError("benchmark ranks use different source validation strategies")
             # Ranks run concurrently: use the slower rank for each paired sample.
             summary = {
                 "schema_version": 2,
                 "mode": args.mode,
+                "execution_policy": result["execution_policy"],
+                "source_validation": result["source_validation"],
                 "passed": all(item["passed"] for item in reports),
                 "device_executed": all(item["device_executed"] for item in reports),
                 "rounds": args.rounds,

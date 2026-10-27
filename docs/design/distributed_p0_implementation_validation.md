@@ -434,3 +434,75 @@ compiler flags 和 header digest 与 `69b9da8b` 一致。本机 205 个头文件
 CPU、SDK 与精简报告样本位于 `output/distributed/compact_report_20261027/`，Host
 隔离测量位于 `output/distributed/performance_host_69b9da8_review/`，均不随 Git 提交。
 真实多卡完整验收和性能结论仍等待相应服务器结果。
+
+## 13. 第二次服务器性能反馈与固定构建产物复用（2026-10-27）
+
+用户回传的精简报告对应 `69b9da8bf92f8693b46ec58eaf400749cbfca5b8`，仍为
+3 轮/2 slots、BF16 64×64、3 次 warmup/20 次测量。三个模式均报告性能 workload
+数值通过，最大绝对误差约 3.57628e-7；没有执行 device 阶段矩阵，
+`reported_device_acceptance=not_run`。离线导出不将该旧测量归属于新工具版本。
+
+| 模式 | execution 中位数 / p95 | E2E 中位数 / p95 | build/cache 检查中位数 |
+| --- | --- | --- | --- |
+| HCCL＋本地 TileLang | 0.200 / 0.344 ms | 0.308 / 0.492 ms | 不适用 |
+| P0-A 交换＋本地 Cube | 33.135 / 36.288 ms | 36.673 / 40.286 ms | 26.358 ms |
+| P0-B 融合 | 19.541 / 19.801 ms | 22.369 / 22.643 ms | 15.582 ms |
+
+该报告支持先排查 Host 构建/校验路径，而不是据此认定设备通信或 Cube 性能差。
+每项分段分别取两 rank 最大值后计算中位数，不能相加或相减还原某次 critical path；
+`build_preflight` 与 build/cache 是并列阶段，包含控制面往返和等待 peer。
+`stream_sync` 只测提交后剩余等待，也不是完整 kernel 延迟。
+
+本轮增加显式 `execution_policy="artifact"`，仅用于 P0-A/P0-B；`D.compile`、
+`D.jit` 和底层 CLI 的默认值仍是 `strict`。artifact 拥有独立 IR 快照，在完整检查
+构建输入后提前加载 `tvm_ffi` executable 并封存实际 packed function、module 及 ABI
+身份。稳态沿原 Session/Bridge 设置设备和 stream，调用封存入口，不再反复读取
+磁盘构建输入或经过可能延迟链接的 Python wrapper。默认 strict 路径仍逐次核查
+持有的 IR、manifest、SHMEM/helper 内容；两种模式都不重新执行定义 factory 的
+Python 源文件，也不承诺检测全局 Op 注册变更。
+
+复用不依赖 mtime。普通 TIR 的身份快检需要精确节点白名单、完整序列化节点扫描、
+容器递归及继承字段的只读反射证明；`ffi.Dict/List`、未知 metadata 或不兼容反射
+接口保留逐次完整 JSON 比较。快检还拒绝源码重绑定、manifest/config 变化以及
+kernel/adapter/executable 句柄替换。显式 build、新 scalar 专化、缓存驱逐后的重建
+仍完整验证，失败不得发布新 artifact。磁盘编辑不改变已加载对象；需要采用新
+构建输入时必须新建相应程序。构建策略和 artifact 身份纳入跨 rank 一致性检查。
+
+epoch 区间与 int32 中间值、实际 regions、信号历史/进度、Session 资源所有权、
+跨 rank 元数据、READY/acquire、DMA 完成后 ACK、退出 drain 和同步均保留。
+统一入口对 P0-A/P0-B 的 compile/device/performance 显式选择 artifact，phased
+继续 strict，并可用 `--execution-policy strict` 对照旧路径。性能报告记录实际
+`execution_policy` 与 `source_validation`，不是只记录命令行期望。首次 artifact
+建立计入首次 build/cache load；稳态与端到端仍包含逐次协议检查、暂存、提交、
+同步与回读。精简报告仍为约 59 行，服务器命令见
+[融合路径验收指南](../testing/distributed_fused.md)。
+
+最终统一 CPU 回归 **444 passed、0 skipped、6 deselected**。全新缓存的真实 SDK
+矩阵 **13/13 通过**：3 个 phased case 保持 strict，10 个 P0-A/P0-B case 使用
+artifact，包括两个 rank 的提前加载/入口封存。其 **20 份融合设备源码与初版完整
+SDK 矩阵逐字一致**。没有修改 C++ 或设备协议，本轮未重跑 CANN 计算片段；以上
+编译通过不计为设备执行，也不把编译矩阵中的负例当成已检出设备错误。
+另外实际启动 artifact 的 P0-B 设备负例：本机缺少 `torch_npu`，两 rank 均退出 2，
+统一入口退出 1、`device_executed=false`、`failed_or_incomplete`，没有将依赖缺失
+误判成预期负例通过。该失败传播证据保存在本轮目录的 `no-device/run_6fwgbnqz/`。
+
+另以两个独立进程运行真实 TCPStore，使用测试 Bridge 和空 kernel，对比 `3b20717e`
+strict 与本轮 artifact。每组 3 次 warmup、20 次测量，暂存、同步、回读调用边界
+一致；最终两组顺序运行，没有与 SDK 编译/回归并行。每个字段先逐次取两 rank
+最大值，再取中位数：
+
+| Host 隔离测量 | P0-A strict → artifact | P0-B strict → artifact |
+| --- | --- | --- |
+| build/cache 检查 | 3.005 → 0.120 ms | 3.503 → 0.149 ms |
+| execution | 6.253 → 2.282 ms | 7.437 → 2.480 ms |
+| 实验内端到端 | 7.987 → 3.109 ms | 9.876 → 3.461 ms |
+
+该实验没有 NPU 数据搬运、设备通信/GEMM 或 P0-A 的额外本地 GEMM；仅定位 Host
+成本，不能与服务器 HCCL 数字直接相除。剩余控制面、计划和绑定成本仍在毫秒级，
+尚未建立快于 HCCL 的结论。真实多卡完整正确性和新模式性能仍待实机验收。
+
+本轮证据位于 `output/distributed/artifact_followup_20261027/`：
+`cpu/run_0hez2_m2/`、`sdk/run_4mx1aj3l/`、`device-source-comparison.json`，以及
+`artifact-tcp/`、`baseline-tcp-reverse/` 的各 rank 原始 Host 样本与 profiling。
+`profile_host.py`、`profile_pair.py` 保留隔离实验的复现命令参数和超时监督；这些本地
+产物不随 Git 提交，服务器性能仍使用正式统一入口。

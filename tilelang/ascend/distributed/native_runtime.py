@@ -397,7 +397,8 @@ class NativeSession:
         self.rank, self.world_size, self.device = rank, world_size, device
         self.profile, self.state = profile, "INITIALIZING"
         self.control, self.bridge, self.timeout = control, bridge, timeout
-        self.shmem_root, self.shmem_library = shmem_root, shmem_library
+        self.shmem_root = None if shmem_root is None else Path(shmem_root).expanduser().resolve()
+        self.shmem_library = shmem_library
         self.abi_fingerprint = bridge.fingerprint
         self.objects, self.channels = {}, {}
         self._bindings = {}

@@ -52,6 +52,7 @@ def test_performance_deadline_overrides_successful_worker_summary(tmp_path, monk
     from examples.distributed import run_p0_validation as runner
 
     def finished_worker(command, directory, timeout, **kwargs):
+        assert command[command.index("--execution-policy") + 1] == "artifact"
         directory.mkdir(parents=True, exist_ok=True)
         runner.write_json(
             directory / "summary.json",
@@ -151,8 +152,10 @@ def test_benchmark_independent_oracle_records_wrong_or_nonfinite_elements():
     assert not check["passed"] and check["mismatches"] == check["nonfinite"] == 1
 
 
-@pytest.mark.parametrize("mode", ["hccl", "p0b"])
-def test_benchmark_main_preserves_timing_boundaries_and_nested_attribution(tmp_path, monkeypatch, mode):
+@pytest.mark.parametrize(
+    "mode,policy,mixed_guard", [("hccl", None, False), ("p0b", "artifact", False), ("p0b", "strict", False), ("p0b", "artifact", True)]
+)
+def test_benchmark_main_preserves_timing_boundaries_and_nested_attribution(tmp_path, monkeypatch, mode, policy, mixed_guard):
     import numpy as np
     import torch
     import torch.distributed as dist
@@ -171,7 +174,10 @@ def test_benchmark_main_preserves_timing_boundaries_and_nested_attribution(tmp_p
         return inputs["a"], inputs["b"]
 
     def reports(value):
-        return [{**deepcopy(value), "rank": rank} for rank in range(2)]
+        copies = [{**deepcopy(value), "rank": rank} for rank in range(2)]
+        if mixed_guard:
+            copies[1]["source_validation"] = "serialized"
+        return copies
 
     monkeypatch.setattr(benchmark, "make_inputs", make_inputs)
     if mode == "hccl":
@@ -203,7 +209,12 @@ def test_benchmark_main_preserves_timing_boundaries_and_nested_attribution(tmp_p
             return np.swapaxes(a @ b, 0, 1).astype(np.float32)
 
         session = SimpleNamespace(preflight=lambda _: None, control=SimpleNamespace(all_gather=reports), copy_out=copy_out)
-        monkeypatch.setattr(benchmark.D, "compile", lambda *args, **kwargs: compiled)
+
+        def compile_program(*args, **kwargs):
+            assert kwargs["execution_policy"] == policy
+            return compiled
+
+        monkeypatch.setattr(benchmark.D, "compile", compile_program)
         monkeypatch.setattr(benchmark.D, "init", lambda **kwargs: session)
         monkeypatch.setattr(benchmark.D, "alloc_symmetric", lambda *args, **kwargs: object())
         monkeypatch.setattr(benchmark.D, "channel", lambda *args, **kwargs: object())
@@ -213,13 +224,33 @@ def test_benchmark_main_preserves_timing_boundaries_and_nested_attribution(tmp_p
         monkeypatch.setattr(
             benchmark.D,
             "complete",
-            lambda _: {"physical_kernel_count": 1, "timing_basis": "host_wall", "timing_seconds": {"plan_validation": 1e-9}},
+            lambda _: {
+                "physical_kernel_count": 1,
+                "execution_policy": policy,
+                "source_validation": "identity" if policy == "artifact" else "serialized",
+                "timing_basis": "host_wall",
+                "timing_seconds": {"plan_validation": 1e-9},
+            },
         )
         monkeypatch.setattr(benchmark.D, "close", lambda _: None)
-    assert benchmark.main(["--mode", mode, "--warmup", "1", "--iterations", "2", "--output-dir", str(tmp_path)]) == 0
+    argv = ["--mode", mode, "--warmup", "1", "--iterations", "2", "--output-dir", str(tmp_path)]
+    if policy == "strict":
+        argv += ["--execution-policy", policy]
+    if mixed_guard:
+        with pytest.raises(AssertionError, match="different source validation"):
+            benchmark.main(argv)
+        assert not (tmp_path / "summary.json").exists()
+        return
+    assert benchmark.main(argv) == 0
     summary = json.loads((tmp_path / "detail.json").read_text())
     compact = json.loads((tmp_path / "summary.json").read_text())
     assert "ranks" not in compact and "passed" not in compact
+    assert summary["execution_policy"] == compact["performance"][mode]["execution_policy"] == policy
+    assert (
+        summary["source_validation"]
+        == compact["performance"][mode]["source_validation"]
+        == (None if mode == "hccl" else "identity" if policy == "artifact" else "serialized")
+    )
     assert summary["correctness_scope"] == "benchmark_workload_only" and summary["full_device_acceptance"] == "not_assessed"
     assert summary["execution"]["count"] == summary["end_to_end"]["count"] == 2
     assert assess_performance({"exit_code": 0, "timed_out": False}, summary, iterations=2)["status"] == "passed"
@@ -311,6 +342,8 @@ def test_offline_report_preserves_metrics_filters_private_data_and_is_bounded(tm
     assert value["stages_median_ms"]["prepare"] == (None if schema == 1 else 4.0)
     assert value["native_median_ms"]["plan_validation"] == (None if schema == 1 else 5.0)
     assert value["stage_availability"] == ("legacy_no_stage_timings" if schema == 1 else "available")
+    assert value["execution_policy"] is None
+    assert value["source_validation"] is None
     assert private not in first + markdown and "/home/" not in first + markdown and "samples_seconds" not in first
     assert len(first.encode()) < 16000 and 30 <= len(markdown.splitlines()) <= 60
     assert summarize([str(source), "--output-dir", str(out)]) == 0
@@ -441,6 +474,36 @@ def test_required_cases_include_hot_slot_multi_launch_delay_and_negative():
         assert any(case.slots == 1 and case.rounds > 1 and case.launches > 1 and case.delay_ms > 0 for case in cases)
         assert any(case.fault == "corrupt_send" for case in cases)
         assert any(case.slots > case.rounds for case in cases)
+
+
+@pytest.mark.parametrize("policy", ["artifact", "strict"])
+def test_validation_matrix_forwards_policy_and_records_case_metadata(tmp_path, monkeypatch, policy):
+    from examples.distributed import run_p0_validation as runner
+    from examples.distributed.summarize_p0 import compact_report
+
+    args = SimpleNamespace(
+        execution_policy=policy,
+        sdk_profile="native",
+        timeout=900,
+        operation_timeout=120,
+        shmem_root=None,
+        shmem_library=None,
+        devices=[0, 1],
+    )
+    monkeypatch.setattr(runner, "run_command", lambda *args, **kwargs: {"exit_code": 2, "timed_out": False})
+    results = []
+    for case in CASES:
+        expected = "strict" if case.execution == "phased" else policy
+        command = runner.case_command(args, case, "device", tmp_path / case.name)
+        assert command[command.index("--execution-policy") + 1] == expected
+        result = runner.run_case(args, case, "device", tmp_path / case.name)
+        assert result["case"]["execution_policy"] == expected
+        results.append(result)
+    compact = compact_report({"schema_version": 1, "results": results})
+    assert len(compact["cases"]) == len(CASES)
+    for report in (compact, compact_report(compact)):
+        for case in report["cases"]:
+            assert case["parameters"]["execution_policy"] == ("strict" if case["case"].startswith("phased-") else policy)
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux /proc and independent process sessions")

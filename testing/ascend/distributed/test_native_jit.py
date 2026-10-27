@@ -235,6 +235,55 @@ def test_factory_defaults_and_named_arguments_share_specialization(jit_factory):
         factory().prim_func = copy_program(16)
 
 
+def test_fused_artifact_jit_reuses_build_and_preserves_owned_outputs(tmp_path, monkeypatch):
+    import tilelang
+
+    headers = fake_headers(tmp_path)
+    bridge = Bridge()
+    compiled = []
+
+    def compile_copy(func, **kwargs):
+        compiled.append(func)
+
+        def copy(src, dst, epoch):
+            bridge.memory[dst["pointer"]][:] = bridge.memory[src["pointer"]]
+
+        return copy
+
+    monkeypatch.setattr(tilelang, "compile", compile_copy)
+    factory = D.jit(inputs=("Src",), outputs=("Dst",), epochs=1, profile=D.P0A_PROFILE, shmem_root=headers, execution_policy="artifact")(
+        copy_program
+    )
+    session = NativeSession(
+        rank=0,
+        world_size=2,
+        device=0,
+        profile=D.P0A_PROFILE,
+        bootstrap="tcp://127.0.0.1:25100",
+        control=Control(),
+        bridge=bridge,
+        shmem_root=headers,
+    )
+    op = factory().bind(session)
+    assert op.compiled.manifest["execution_policy"] == "artifact"
+    first = np.arange(8, dtype=np.float32)
+    first_output = op(first)
+    np.testing.assert_array_equal(first_output, first)
+    allocations = sum(call[0] == "allocate" for call in bridge.calls)
+    builds = len(compiled)
+    assert builds > 0
+    second = first + 17
+    second_output = op(second)
+    np.testing.assert_array_equal(second_output, second)
+    np.testing.assert_array_equal(first_output, first)
+    assert len(compiled) == builds
+    assert sum(call[0] == "allocate" for call in bridge.calls) == allocations
+    assert session._epoch == 2 and session.state == "LOCAL_DONE"
+    D.close(session)
+    np.testing.assert_array_equal(first_output, first)
+    np.testing.assert_array_equal(second_output, second)
+
+
 def test_static_cache_preserves_python_argument_types(jit_factory):
     def typed_factory(marker=1):
         return copy_program(8 if type(marker) is int else 16)

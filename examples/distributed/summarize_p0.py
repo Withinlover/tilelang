@@ -188,6 +188,8 @@ def _performance(item, fallback_ranks):
     )
     return {
         "status": _enum(item.get("status"), {"passed", "failed", "skipped"}),
+        "execution_policy": _enum(summary.get("execution_policy"), {"strict", "artifact"}),
+        "source_validation": _enum(summary.get("source_validation"), {"identity", "serialized"}),
         "reported_passed": _boolean(summary.get("passed")),
         "source_schema_version": _integer(summary.get("schema_version")),
         "exit_code": _integer(process.get("exit_code")),
@@ -248,7 +250,10 @@ def compact_report(report, *, provenance=None, fallback_ranks=None):
                     "stage": stage,
                     "case": name,
                     "status": status,
-                    "parameters": {key: _integer(case.get(key)) for key in ("rounds", "slots", "launches", "delay_ms")},
+                    "parameters": {
+                        **{key: _integer(case.get(key)) for key in ("rounds", "slots", "launches", "delay_ms")},
+                        "execution_policy": _enum(case.get("execution_policy"), {"strict", "artifact"}),
+                    },
                     "fault": _enum(case.get("fault"), {"none", "corrupt_send"}),
                     "exit_code": _integer(process.get("exit_code")),
                     "timed_out": _boolean(process.get("timed_out")),
@@ -345,6 +350,8 @@ def _sanitize_existing(report):
             "schema_version": item.get("source_schema_version"),
             "passed": item.get("reported_passed"),
             "device_executed": item.get("device_executed"),
+            "execution_policy": item.get("execution_policy"),
+            "source_validation": item.get("source_validation"),
             "workload": params,
         }
         for boundary in ("execution", "end_to_end"):
@@ -440,12 +447,16 @@ def render_markdown(report):
             )
             + " |"
         )
-    lines += ["", "| Mode | rounds / slots / iterations / warmup / tile | dtype / output | Stage availability |", "|---|---|---|---|"]
+    lines += [
+        "",
+        "| Mode | Policy / source guard | rounds / slots / iterations / warmup / tile | dtype / output | Stage availability |",
+        "|---|---|---|---|---|",
+    ]
     for mode in MODES:
         item = performance[mode] or {}
         params = _mapping(item.get("parameters"))
         lines.append(
-            f"| {mode} | "
+            f"| {mode} | {pair(item.get('execution_policy'), item.get('source_validation'))} | "
             + " / ".join(_display(params.get(key)) for key in ("rounds", "slots", "iterations", "warmup", "tile"))
             + f" | {_display(params.get('dtype'))} / {_display(params.get('output_dtype'))} | {_display(item.get('stage_availability'))} |"
         )
@@ -476,6 +487,24 @@ def render_markdown(report):
         + "; ".join(
             stage + "=" + "/".join(_display(count[key]) for key in ("total", "passed", "failed", "skipped", "unknown"))
             for stage, count in report["stage_counts"].items()
+        )
+        + ". Case policies: "
+        + "; ".join(
+            mode
+            + "="
+            + (
+                "+".join(
+                    sorted(
+                        {
+                            row["parameters"]["execution_policy"]
+                            for row in report["cases"]
+                            if row["case"].startswith(mode + "-") and row["parameters"].get("execution_policy") is not None
+                        }
+                    )
+                )
+                or "null"
+            )
+            for mode in ("phased", "p0a", "p0b")
         )
         + ".",
         "CPU (tests/failures/errors/skipped): "

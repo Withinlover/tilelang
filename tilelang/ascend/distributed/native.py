@@ -73,6 +73,8 @@ class NativeCompiledProgram:
     compiler/cache; only ``run`` requires an initialized native Session.
     """
 
+    _supports_artifact = False
+
     def __init__(
         self,
         program,
@@ -85,7 +87,13 @@ class NativeCompiledProgram:
         shmem_root=None,
         transport_compile_profile="native",
         debug=True,
+        execution_policy="strict",
     ):
+        if execution_policy not in ("strict", "artifact"):
+            fail("execution_policy must be strict or artifact")
+        if execution_policy == "artifact" and not self._supports_artifact:
+            fail("artifact execution currently requires the fused P0-A or P0-B profile")
+        self.execution_policy = execution_policy
         if transport_compile_profile not in ("native", "cann-9.1-shmem"):
             fail(f"unsupported transport compile profile {transport_compile_profile!r}")
         self.shmem_root = None if shmem_root is None else Path(shmem_root).expanduser().resolve()
@@ -101,8 +109,21 @@ class NativeCompiledProgram:
             fail("native phases require an eager canonical TD PrimFunc")
         if len(source_manifest["groups"]) != 1 or source_manifest["groups"][0]["size"] != 2 or len(source_manifest["channels"]) != 1:
             fail("native phases require exactly two ranks, one static group and one channel")
-        self.prim_func = program
         self.ir_json = tvm.ir.save_json(program)
+        self._source_document = self.ir_json
+        self._source_generation = 0
+        self._identity_guard = False
+        if execution_policy == "artifact":
+            from .artifact_identity import source_supports_identity_guard
+
+            self._identity_guard = source_supports_identity_guard(program, self.ir_json)
+            # Own the serialized source snapshot. Public functional IR updates
+            # create another root; mutable/unknown metadata retains full JSON
+            # comparison on every use instead of relying on node identity.
+            self._prim_func = tvm.ir.load_json(self.ir_json)
+        else:
+            self._prim_func = program
+        self._source_root = self._prim_func
         self.source_sha256 = _digest(self.ir_json)
         self.source_manifest = canonical_manifest(source_manifest)
         self.manifest = {
@@ -113,6 +134,7 @@ class NativeCompiledProgram:
             "source_descriptor_encoding": self.source_manifest["descriptor"]["encoding"],
             "descriptor": {"abi_version": 1, "encoding": "host-phases-shmem-v1", "device_argument": False},
             "execution": "native-sequential-host-phases",
+            "execution_policy": execution_policy,
             "target_arch": "dav-3510",
             "compute_compile_profile": compile_profile,
             "transport_compile_profile": transport_compile_profile,
@@ -132,6 +154,31 @@ class NativeCompiledProgram:
         self._manifest_digest = manifest_digest(self.manifest)
         self._kernels = {}
 
+    @property
+    def prim_func(self):
+        return self._prim_func
+
+    @prim_func.setter
+    def prim_func(self, value):
+        self._source_generation += 1
+        self._prim_func = value
+
+    @property
+    def source_validation(self):
+        return "identity" if self.execution_policy == "artifact" and self._identity_guard else "serialized"
+
+    def _validate_source_identity(self, *, strict=False):
+        if self.execution_policy != self.manifest["execution_policy"]:
+            fail("compiled execution policy was modified")
+        if self.ir_json != self._source_document or self.source_sha256 != self.manifest["program_sha256"]:
+            fail("compiled distributed source or execution manifest was modified")
+        if self.execution_policy == "artifact" and (self._source_generation or not self.prim_func.same_as(self._source_root)):
+            fail("compiled artifact source was rebound; create a new compiled program")
+        if (strict or self.execution_policy == "strict" or not self._identity_guard) and tvm.ir.save_json(self.prim_func) != self.ir_json:
+            fail("compiled distributed source or execution manifest was modified")
+        if manifest_digest(self.manifest) != self._manifest_digest:
+            fail("compiled distributed source or execution manifest was modified")
+
     _plan_program = staticmethod(plan_program)
 
     @staticmethod
@@ -143,8 +190,7 @@ class NativeCompiledProgram:
 
     def plan(self, *, scalars=None, epoch_base=0, epoch_end=None, initial_signals=None):
         """Validate every rank and phase before any device request is submitted."""
-        if tvm.ir.save_json(self.prim_func) != self.ir_json or manifest_digest(self.manifest) != self._manifest_digest:
-            fail("compiled distributed source or execution manifest was modified")
+        self._validate_source_identity()
         if isinstance(epoch_base, bool) or not isinstance(epoch_base, int) or not 0 <= epoch_base < MAX_EPOCH:
             fail("epoch base must be a nonnegative int32 below the final signal epoch")
         values = dict(scalars or {})
@@ -384,6 +430,10 @@ class NativeCompiledProgram:
             _json(out / "build.json", self.build_report)
         return self._kernels
 
+    def _prepare_executable(self, *, shmem_root, plans, output_dir=None):
+        self.build(shmem_root=shmem_root, plans=plans, output_dir=output_dir)
+        return None
+
     def run(self, *, session, ticket, buffers=None, scalars=None, **kwargs):
         started = time.perf_counter()
         timings = {}
@@ -433,8 +483,9 @@ class NativeCompiledProgram:
         timings["plan_preflight"] = time.perf_counter() - stamp
         stamp = time.perf_counter()
         build_error = None
+        artifact_id = None
         try:
-            self.build(
+            artifact_id = self._prepare_executable(
                 shmem_root=session.shmem_root,
                 plans=plans,
                 output_dir=self.output_dir / f"compiled_rank{session.rank}" if self.debug else None,
@@ -443,7 +494,9 @@ class NativeCompiledProgram:
             build_error = error
         timings["build_or_cache_validation"] = time.perf_counter() - stamp
         stamp = time.perf_counter()
-        session.preflight({"compiled": build_error is None, "error": None if build_error is None else str(build_error)})
+        session.preflight(
+            {"compiled": build_error is None, "error": None if build_error is None else str(build_error), "artifact_id": artifact_id}
+        )
         timings["build_preflight"] = time.perf_counter() - stamp
         stamp = time.perf_counter()
         if build_error is not None:
@@ -467,6 +520,9 @@ class NativeCompiledProgram:
             "kernel_executed": False,
             "completed": False,
             "execution": self.manifest["execution"],
+            "execution_policy": self.execution_policy,
+            "source_validation": self.source_validation,
+            "artifact_id": artifact_id,
             "transport_abi": session.abi_fingerprint,
             "phases": [],
             "errors": [],

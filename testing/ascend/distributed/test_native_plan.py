@@ -374,3 +374,12 @@ def test_shmem_fingerprint_preserves_component_order_and_symlink_semantics(tmp_p
     replaced = checked()
     target.unlink()
     assert checked() != replaced  # A now-dangling header link is omitted.
+
+
+def test_phased_native_preserves_strict_policy_and_rejects_artifact():
+    native = NativeCompiledProgram(transfer())
+    assert native.execution_policy == native.manifest["execution_policy"] == "strict"
+    with pytest.raises(ValueError, match="requires the fused"):
+        NativeCompiledProgram(transfer(), execution_policy="artifact")
+    with pytest.raises(ValueError, match="execution_policy must be"):
+        NativeCompiledProgram(transfer(), execution_policy="unknown")

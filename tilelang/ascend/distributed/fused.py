@@ -7,6 +7,7 @@ acquire and release to the ordinary DMA dependency graph.
 """
 
 from collections import OrderedDict
+from dataclasses import dataclass
 import functools
 import hashlib
 import inspect
@@ -375,9 +376,30 @@ def make_fused_prim_func(program, specs, plan, *, rank, mixed):
     )
 
 
+@dataclass(frozen=True)
+class _LoadedFusedKernel:
+    rank: int
+    key: tuple
+    kernel: object
+    entry: object
+    adapter: object = None
+    executable: object = None
+    module: object = None
+    wrapper: object = None
+
+
+@dataclass(frozen=True)
+class _FusedArtifact:
+    artifact_id: str
+    build_root: str
+    configuration: tuple
+    kernels: tuple
+
+
 class FusedCompiledProgram(NativeCompiledProgram):
     """One ordinary tvm_ffi kernel per rank, using the existing Session."""
 
+    _supports_artifact = True
     _plan_program = staticmethod(functools.partial(plan_program, allow_vector=True))
 
     def __init__(self, program, *, profile=P0A_PROFILE, **kwargs):
@@ -419,6 +441,25 @@ class FusedCompiledProgram(NativeCompiledProgram):
         self._reference_cache = OrderedDict()
         self._expanded_cache = OrderedDict()
         self._description_cache = OrderedDict()
+        self._compiled_configuration = self._artifact_configuration()
+
+    def _artifact_configuration(self):
+        return (
+            self.profile,
+            self.mode,
+            self.compile_profile,
+            self.transport_compile_profile,
+            str(self.shmem_root),
+            self.header_fingerprint,
+            str(self.helper_path),
+            self.helper_fingerprint,
+            self.sdk_adapter_fingerprint,
+        )
+
+    def _validate_source_identity(self, *, strict=False):
+        super()._validate_source_identity(strict=strict)
+        if self.execution_policy == "artifact" and self._artifact_configuration() != self._compiled_configuration:
+            fail("compiled artifact configuration was modified; create a new compiled program")
 
     def _description(self, instruction):
         if instruction[0] not in ("gemm", "vector"):
@@ -468,13 +509,14 @@ class FusedCompiledProgram(NativeCompiledProgram):
             if any(proof is None for proof in proofs)
             else (max(proof.min_base for proof in proofs), min(proof.max_base for proof in proofs))
         )
-        entry = {"plans": reference, "descriptions": descriptions, "funcs": None, "keys": None, "proof": interval}
+        entry = {"plans": reference, "descriptions": descriptions, "funcs": None, "keys": None, "proof": interval, "artifact": None}
         # A scalar specialization owns its TIR and kernels. Keep this working set
         # bounded; an evicted specialization is rebuilt on its next use.
         if len(self._reference_cache) == 4:
             _, evicted = self._reference_cache.popitem(last=False)
             for kernel_key in (evicted["keys"] or {}).values():
-                self._kernels.pop(kernel_key, None)
+                if not any(kernel_key in (other["keys"] or {}).values() for other in self._reference_cache.values()):
+                    self._kernels.pop(kernel_key, None)
         self._reference_cache[key] = entry
         return entry
 
@@ -502,7 +544,8 @@ class FusedCompiledProgram(NativeCompiledProgram):
         return _clone_containers(self._expanded_cache[key])
 
     def plan(self, *, scalars=None, epoch_base=0, **kwargs):
-        self._configs()  # Revalidate the bound device helper before any launch plan.
+        if self.execution_policy == "strict":
+            self._configs()  # Strict mode follows current device helper contents.
         plans = super().plan(scalars=scalars, epoch_base=epoch_base, **kwargs)
         # Publish this specialization only after every interval/ref/progress
         # check succeeds. A failed plan must not switch a previous build token
@@ -566,13 +609,13 @@ class FusedCompiledProgram(NativeCompiledProgram):
         elif self._normal_plans is None or _container_key(plans) != self._current_plan_token:
             fail("fused build plans must come from this program's validated current plan")
         self._configs()
-        if tvm.ir.save_json(self.prim_func) != self.ir_json or manifest_digest(self.manifest) != self._manifest_digest:
-            fail("compiled distributed source or execution manifest was modified")
+        self._validate_source_identity(strict=True)
         fingerprint = self._header_fingerprint(shmem_root)
         if self.header_fingerprint is not None and fingerprint != self.header_fingerprint:
             fail("SHMEM device headers changed after native compile; create a new compiled program and Session")
         artifacts = []
         entry = self._active_reference
+        self._check_artifact_handles(entry["artifact"])
         identity = (fingerprint, self.compile_profile, self.transport_compile_profile)
         if entry["keys"] is None or entry.get("build_identity") != identity:
             for old_key in (entry["keys"] or {}).values():
@@ -608,17 +651,101 @@ class FusedCompiledProgram(NativeCompiledProgram):
                         "compiled_source_sha256": _digest(compiled),
                     }
                 )
+        pending_artifact = entry["artifact"]
+        if self.execution_policy == "artifact":
+            loaded = tuple(self._load_artifact_kernel(r, self._rank_keys[r]) for r in (0, 1))
+            # Compilation/loading must finish against the validated source
+            # inputs. A failed load or observed edit cannot publish an artifact.
+            self._configs()
+            self._validate_source_identity(strict=True)
+            if self._header_fingerprint(shmem_root) != fingerprint:
+                fail("SHMEM device headers changed during artifact build")
+            identity = {
+                "manifest": self._manifest_digest,
+                "rank_kernel_keys": [list(self._rank_keys[r]) for r in (0, 1)],
+            }
+            pending_artifact = _FusedArtifact(
+                manifest_digest(identity),
+                str(Path(shmem_root).expanduser().resolve()),
+                self._artifact_configuration(),
+                loaded,
+            )
         self.build_report = {
             "profile": self.profile,
             "device_executed": False,
             "physical_kernel_count_per_rank": 1,
+            "execution_policy": self.execution_policy,
+            "source_validation": "serialized",
+            "artifact_source_validation": self.source_validation,
+            "artifact_id": None if pending_artifact is None else pending_artifact.artifact_id,
             "source_sha256": self.source_sha256,
             "transport_header_sha256": fingerprint,
             "artifacts": artifacts,
         }
         if output_dir is not None:
             _json(Path(output_dir) / "build.json", self.build_report)
+        entry["artifact"] = pending_artifact
         return self._kernels
+
+    def _load_artifact_kernel(self, rank, key):
+        kernel = self._kernels[key]
+        adapter = getattr(kernel, "adapter", None)
+        if adapter is None:
+            # CPU regression bridges use a plain callable in place of a JIT
+            # kernel. Production kernels always carry the tvm_ffi adapter.
+            return _LoadedFusedKernel(rank, key, kernel, kernel)
+        from tilelang.jit.adapter.tvm_ffi import TVMFFIKernelAdapter
+
+        if not isinstance(adapter, TVMFFIKernelAdapter) or adapter.result_idx or adapter._ffi_callee_allocated_output_abi:
+            fail("fused artifacts require the explicit-output tvm_ffi ABI")
+        params = adapter.prim_func.params
+        if len(adapter.params) != len(self.manifest["objects"]) + 1 or len(params) != len(adapter.params):
+            fail("fused artifact parameters must be exactly symmetric objects followed by epoch0")
+        symbols = adapter.dynamic_symbolic_map
+        if symbols is None or len(symbols) != len(params) or any(symbols.get(param) != (2, i, -1, 1) for i, param in enumerate(params)):
+            fail("fused artifacts do not support implicit shape or stride parameters")
+        executable = adapter.get_exportable_executable()
+        module = executable.jit() if isinstance(executable, tvm.runtime.Executable) else executable
+        # Capture the actual packed function, not a Python wrapper that can
+        # lazily rebuild an executable or allocate implicit outputs on launch.
+        return _LoadedFusedKernel(rank, key, kernel, module.main, adapter, executable, module, kernel.torch_function)
+
+    def _check_artifact_handles(self, artifact):
+        if artifact is None:
+            return False
+        if artifact.configuration != self._artifact_configuration():
+            fail("compiled artifact configuration was modified; create a new compiled program")
+        available = True
+        for loaded in artifact.kernels:
+            if loaded.key not in self._kernels:
+                available = False
+            elif self._kernels[loaded.key] is not loaded.kernel:
+                fail("compiled artifact kernel handle was replaced; create a new compiled program")
+            if loaded.adapter is not None and (
+                loaded.kernel.adapter is not loaded.adapter
+                or loaded.kernel.torch_function is not loaded.wrapper
+                or loaded.adapter.executable is not loaded.executable
+            ):
+                fail("compiled artifact executable handle was replaced; create a new compiled program")
+        return available
+
+    def _prepare_executable(self, *, shmem_root, plans, output_dir=None):
+        if self.execution_policy == "artifact":
+            self._validate_source_identity()
+            if _container_key(plans) != self._current_plan_token:
+                fail("artifact execution requires this program's validated current plan")
+            artifact = self._active_reference["artifact"]
+            if self._check_artifact_handles(artifact):
+                # Session.shmem_root is resolved at initialization. No stat,
+                # header scan, compiler-environment discovery or serialization
+                # is needed to select an already loaded artifact.
+                if str(shmem_root) != artifact.build_root:
+                    fail("compiled artifact SHMEM root does not match the Session")
+                self._rank_keys = {loaded.rank: loaded.key for loaded in artifact.kernels}
+                return artifact.artifact_id
+        self.build(shmem_root=shmem_root, plans=plans, output_dir=output_dir)
+        artifact = self._active_reference["artifact"]
+        return None if artifact is None else artifact.artifact_id
 
     def _execute(self, plans, session, bound, report):
         values = []
@@ -629,7 +756,12 @@ class FusedCompiledProgram(NativeCompiledProgram):
                 else bound[spec["key"]].view(shape=tuple(spec["shape"]))
             )
         values.append(report["epoch_base"])
-        session.launch_kernel(self._kernels[self._rank_keys[session.rank]], *values)
+        if self.execution_policy == "artifact":
+            artifact = self._active_reference["artifact"]
+            entry = next(loaded.entry for loaded in artifact.kernels if loaded.rank == session.rank)
+        else:
+            entry = self._kernels[self._rank_keys[session.rank]]
+        session.launch_kernel(entry, *values)
         report.update(device_executed=True, kernel_executed=True, physical_kernel_count=1)
         report["phases"] = [{"index": index, "op": item[0]} for index, item in enumerate(plans[session.rank])]
 

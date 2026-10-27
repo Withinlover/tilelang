@@ -225,6 +225,8 @@ def case_command(args, case, stage, directory):
         "build" if stage == "compile" else "run",
         "--execution",
         case.execution,
+        "--execution-policy",
+        "strict" if case.execution == "phased" else args.execution_policy,
         "--case",
         case.operation,
         "--rounds",
@@ -259,7 +261,7 @@ def run_case(args, case, stage, directory):
     process = run_command(case_command(args, case, stage, directory), directory, args.timeout)
     result = {
         "stage": stage,
-        "case": asdict(case),
+        "case": {**asdict(case), "execution_policy": "strict" if case.execution == "phased" else args.execution_policy},
         "directory": str(directory),
         "process": process,
         "status": "failed",
@@ -275,6 +277,7 @@ def run_case(args, case, stage, directory):
                 and not process["timed_out"]
                 and build.get("compiled")
                 and build.get("device_executed") is False
+                and build.get("execution_policy", "strict") == result["case"]["execution_policy"]
                 else "failed"
             )
         return result
@@ -282,6 +285,8 @@ def run_case(args, case, stage, directory):
     if len(paths) == 1:
         manifest = json.loads(paths[0].read_text())
         result.update(assess_device(process, manifest, negative=case.fault != "none"))
+        if manifest.get("execution_policy", "strict") != result["case"]["execution_policy"]:
+            result["status"] = "failed"
         result["manifest"] = str(paths[0])
         result["rank_exit_codes"] = manifest.get("rank_exit_codes")
         result["accuracy"] = manifest.get("accuracy")
@@ -330,6 +335,12 @@ def main(argv=None):
     parser.add_argument("--list", action="store_true")
     parser.add_argument("--output-dir", default="output/distributed/p0-acceptance")
     parser.add_argument("--sdk-profile", choices=("native", "cann-9.1"), default="cann-9.1")
+    parser.add_argument(
+        "--execution-policy",
+        choices=("strict", "artifact"),
+        default="artifact",
+        help="P0 compile/device/performance policy; phased cases always use strict",
+    )
     parser.add_argument("--shmem-root", default=os.environ.get("SHMEM_ROOT"))
     parser.add_argument("--shmem-library", default=os.environ.get("SHMEM_LIBRARY"))
     parser.add_argument("--devices", type=int, nargs=2, default=[0, 1])
@@ -404,6 +415,8 @@ def main(argv=None):
                         mode,
                         "--iterations",
                         str(args.benchmark_iterations),
+                        "--execution-policy",
+                        args.execution_policy,
                         "--bootstrap-port",
                         str(bootstrap_port),
                         "--control-port",
